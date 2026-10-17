@@ -7,10 +7,13 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import smtplib
 import sqlite3
 import ssl
+import subprocess
 import time
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -32,6 +35,10 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+BACKUP_DIR = Path(os.environ.get("MASAHA_BACKUP_DIR", ROOT / "backups"))
+BACKUP_INTERVAL = max(3600, int(os.environ.get("MASAHA_BACKUP_INTERVAL", "86400")))
+BACKUP_KEEP = max(1, int(os.environ.get("MASAHA_BACKUP_KEEP", "7")))
+BACKUP_BUCKET = os.environ.get("MASAHA_BACKUP_BUCKET", "").rstrip("/")
 
 
 def send_email(to, subject, body):
@@ -71,6 +78,62 @@ def issue_verification_code(db, user):
     if not sent:
         print(f"Email verification code for {user['email']} (valid for 10 minutes): {code}")
     return True
+
+
+def backup_database():
+    """Create a consistent SQLite snapshot and retain only the newest backups."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(BACKUP_DIR, 0o700)
+    except OSError:
+        pass
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = BACKUP_DIR / f"masaha-{stamp}.sqlite3"
+    temporary = BACKUP_DIR / f".{target.name}.tmp"
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as source:
+            with sqlite3.connect(temporary, timeout=30) as destination:
+                source.backup(destination)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    copies = sorted(BACKUP_DIR.glob("masaha-*.sqlite3"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old in copies[BACKUP_KEEP:]:
+        old.unlink(missing_ok=True)
+    print(f"Database backup saved: {target}")
+    if BACKUP_BUCKET:
+        gcloud = shutil.which("gcloud")
+        if not gcloud:
+            raise RuntimeError("MASAHA_BACKUP_BUCKET is set but the gcloud CLI is not installed")
+        if not BACKUP_BUCKET.startswith("gs://"):
+            raise ValueError("MASAHA_BACKUP_BUCKET must start with gs://")
+        remote = f"{BACKUP_BUCKET}/{target.name}"
+        subprocess.run([gcloud, "storage", "cp", str(target), remote], check=True, timeout=180, capture_output=True, text=True)
+        print(f"Offsite database backup uploaded: {remote}")
+    return target
+
+
+def consume_rate_limit(db, user_id, action, maximum, window_seconds):
+    current = now()
+    cutoff = current - window_seconds
+    db.execute("DELETE FROM rate_events WHERE created_at<?", (current - 86400,))
+    count = db.execute("SELECT COUNT(*) FROM rate_events WHERE user_id=? AND action=? AND created_at>?", (user_id, action, cutoff)).fetchone()[0]
+    if count >= maximum:
+        first = db.execute("SELECT MIN(created_at) FROM rate_events WHERE user_id=? AND action=? AND created_at>?", (user_id, action, cutoff)).fetchone()[0]
+        return max(1, window_seconds - (current - first))
+    db.execute("INSERT INTO rate_events(user_id,action,created_at) VALUES(?,?,?)", (user_id, action, current))
+    return 0
+
+
+def backup_worker():
+    while True:
+        time.sleep(BACKUP_INTERVAL)
+        try:
+            backup_database()
+        except Exception as exc:
+            print("Scheduled database backup failed:", repr(exc))
 
 
 @contextmanager
@@ -144,10 +207,15 @@ def init_db():
           expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS rate_events (
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          action TEXT NOT NULL, created_at INTEGER NOT NULL
+        );
         CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase ON users(username COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS topics_created ON topics(created_at DESC);
         CREATE INDEX IF NOT EXISTS comments_topic ON comments(topic_id, created_at);
         CREATE INDEX IF NOT EXISTS reports_status ON reports(status, created_at);
+        CREATE INDEX IF NOT EXISTS rate_events_user_action ON rate_events(user_id,action,created_at);
         """)
         # Add fields when opening a database created by an older version.
         for table, name, declaration in (
@@ -326,28 +394,36 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 search = query.get("q", [""])[0].strip()[:100]
                 category = query.get("category", [""])[0]
                 sort = query.get("sort", ["newest"])[0]
+                try:
+                    limit = max(1, min(50, int(query.get("limit", ["20"])[0])))
+                    offset = max(0, int(query.get("offset", ["0"])[0]))
+                except ValueError:
+                    limit, offset = 20, 0
                 viewer = self.session_user(db)
-                sql = """SELECT t.*, u.username, u.display_name,u.avatar_url AS author_avatar,
+                select_sql = """SELECT t.*, u.username, u.display_name,u.avatar_url AS author_avatar,
                          (SELECT COUNT(*) FROM comments c WHERE c.topic_id=t.id) AS comment_count,
                          (SELECT COUNT(*) FROM likes l WHERE l.topic_id=t.id) AS like_count,
                          EXISTS(SELECT 1 FROM likes l WHERE l.topic_id=t.id AND l.user_id=?) AS liked_by_me,
                          EXISTS(SELECT 1 FROM bookmarks b WHERE b.topic_id=t.id AND b.user_id=?) AS bookmarked_by_me
                          FROM topics t JOIN users u ON u.id=t.user_id WHERE t.deleted=0"""
-                values = [viewer["id"] if viewer else -1, viewer["id"] if viewer else -1]
+                filters = ""
+                filter_values = []
                 if search:
-                    sql += " AND (t.title LIKE ? OR t.body LIKE ? OR u.display_name LIKE ?)"
-                    needle = "%" + search.replace("%", "\\%").replace("_", "\\_") + "%"
-                    values.extend([needle, needle, needle])
+                    filters += " AND (t.title LIKE ? OR t.body LIKE ? OR u.display_name LIKE ?)"
+                    needle = "%" + search + "%"
+                    filter_values.extend([needle, needle, needle])
                 if category in ("programming", "learning", "general"):
-                    sql += " AND t.category=?"; values.append(category)
+                    filters += " AND t.category=?"; filter_values.append(category)
+                order = " ORDER BY t.created_at DESC"
                 if sort == "popular":
-                    sql += " ORDER BY like_count DESC,t.created_at DESC LIMIT 100"
+                    order = " ORDER BY like_count DESC,t.created_at DESC"
                 elif sort == "oldest":
-                    sql += " ORDER BY t.created_at ASC LIMIT 100"
-                else:
-                    sql += " ORDER BY t.created_at DESC LIMIT 100"
+                    order = " ORDER BY t.created_at ASC"
+                total = db.execute("SELECT COUNT(*) FROM topics t JOIN users u ON u.id=t.user_id WHERE t.deleted=0" + filters, filter_values).fetchone()[0]
+                sql = select_sql + filters + order + " LIMIT ? OFFSET ?"
+                values = [viewer["id"] if viewer else -1, viewer["id"] if viewer else -1, *filter_values, limit, offset]
                 rows = db.execute(sql, values).fetchall()
-                return self.send_json(200, {"topics": [self.topic_json(row) for row in rows]})
+                return self.send_json(200, {"topics": [self.topic_json(row) for row in rows], "total": total})
             if path.startswith("/api/topics/") and path.count("/") == 3:
                 try: topic_id = int(path.rsplit("/", 1)[1])
                 except ValueError: return self.send_json(400, {"error": "Invalid topic id"})
@@ -565,6 +641,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     image = str(data.get("image", ""))
                     if image and (len(image) > 2_800_000 or not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}", image)):
                         return self.send_json(400, {"error": "Image must be PNG, JPEG, or WebP and under 2 MB"})
+                    duplicate = db.execute("SELECT 1 FROM topics WHERE user_id=? AND deleted=0 AND lower(title)=lower(?) AND lower(body)=lower(?) AND created_at>? LIMIT 1", (user["id"], title, body, now()-86400)).fetchone()
+                    if duplicate:
+                        return self.send_json(409, {"error": "DUPLICATE_TOPIC"})
+                    retry = consume_rate_limit(db, user["id"], "topic", 5, 3600)
+                    if retry:
+                        return self.send_json(429, {"error": "RATE_LIMITED", "retryAfter": retry})
                     cur = db.execute("INSERT INTO topics(user_id,title,body,category,created_at,image_url) VALUES(?,?,?,?,?,?)",
                                      (user["id"], title, body, category, now(), image))
                     return self.send_json(201, {"id": cur.lastrowid})
@@ -575,6 +657,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     topic = db.execute("SELECT id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
                     if not body or len(body) > 3000: return self.send_json(400, {"error": "Comment must be 1–3000 characters"})
+                    retry = consume_rate_limit(db, user["id"], "comment", 20, 3600)
+                    if retry:
+                        return self.send_json(429, {"error": "RATE_LIMITED", "retryAfter": retry})
                     cur = db.execute("INSERT INTO comments(topic_id,user_id,body,created_at) VALUES(?,?,?,?)",
                                      (topic_id, user["id"], body, now()))
                     owner = db.execute("SELECT user_id FROM topics WHERE id=?", (topic_id,)).fetchone()[0]
@@ -588,6 +673,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     reason = str(data.get("reason", "")).strip()[:500]
                     if kind not in ("topic", "comment") or not reason:
                         return self.send_json(400, {"error": "Choose a reason for the report"})
+                    retry = consume_rate_limit(db, user["id"], "report", 10, 3600)
+                    if retry:
+                        return self.send_json(429, {"error": "RATE_LIMITED", "retryAfter": retry})
                     exists = db.execute("SELECT id FROM topics WHERE id=? AND deleted=0", (target_id,)).fetchone() if kind == "topic" else db.execute("SELECT id FROM comments WHERE id=?", (target_id,)).fetchone()
                     if not exists: return self.send_json(404, {"error": "Content not found"})
                     db.execute("INSERT INTO reports(reporter_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?)",
@@ -605,9 +693,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                             print("Report notification email failed:", repr(exc))
                     return self.send_json(201, {"ok": True})
                 if path.startswith("/api/topics/") and path.endswith("/delete"):
-                    if not self.require_admin(user): return
                     try: topic_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
+                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    if not topic: return self.send_json(404, {"error": "Topic not found"})
+                    if user["role"] != "admin" and topic["user_id"] != user["id"]:
+                        return self.send_json(403, {"error": "Only the author or an admin can remove this topic"})
                     db.execute("UPDATE topics SET deleted=1 WHERE id=?", (topic_id,))
                     db.execute("UPDATE reports SET status='resolved' WHERE target_type='topic' AND target_id=?", (topic_id,))
                     return self.send_json(200, {"ok": True})
@@ -633,13 +724,19 @@ class ForumHandler(SimpleHTTPRequestHandler):
 
     def do_PUT(self):
         path = urlparse(self.path).path
-        if path.startswith("/api/admin/topics/"):
+        if path.startswith("/api/admin/topics/") or (path.startswith("/api/topics/") and path.count("/") == 3):
             try:
                 topic_id = int(path.rsplit("/", 1)[1])
                 data = self.read_json()
                 with connect() as db:
                     user = self.require_user(db)
-                    if not user or not self.require_admin(user): return
+                    if not user: return
+                    admin_route = path.startswith("/api/admin/")
+                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    if not topic: return self.send_json(404, {"error": "Topic not found"})
+                    if admin_route and not self.require_admin(user): return
+                    if not admin_route and user["role"] != "admin" and topic["user_id"] != user["id"]:
+                        return self.send_json(403, {"error": "Only the author or an admin can edit this topic"})
                     title = str(data.get("title", "")).strip()
                     body = str(data.get("body", "")).strip()
                     category = str(data.get("category", "general"))
@@ -676,5 +773,10 @@ class ForumHandler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    try:
+        backup_database()
+    except Exception as exc:
+        print("Initial database backup failed:", repr(exc))
+    threading.Thread(target=backup_worker, name="masaha-backups", daemon=True).start()
     print(f"Masaha forum running at http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), ForumHandler).serve_forever()
