@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="مساحة — منتدى عربي وإنجليزي للنقاش وتبادل الأفكار.">
+  <meta name="theme-color" content="#173d30"><title>مساحة | منتدى للنقاش</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar"><div class="wrap nav">
+    <a class="brand" href="#home"><span class="logo">م</span><span data-t="brand">مساحة</span></a>
+    <nav class="navlinks"><a href="#home" data-t="home">الرئيسية</a><a href="#categories" data-t="categories">الأقسام</a></nav>
+    <div class="nav-actions"><button class="quiet" id="profile-link" hidden data-t="myProfile">ملفي</button><button class="login-button" id="login-open" data-t="login">دخول / حساب جديد</button><button class="lang" id="language">English</button></div>
+  </div></header>
+  <main class="wrap" id="home">
+    <section class="hero"><div><span class="eyebrow" data-t="eyebrow">مجتمعك يبدأ من هنا</span><h1 data-t="headline">أفكار بتكبر لما نتشاركها.</h1><p data-t="subtitle">اسأل، شارك خبرتك، وتعرّف على ناس عندهم نفس اهتماماتك.</p></div><div class="hero-art" aria-hidden="true">💬</div></section>
+    <section class="searchbar"><form id="search-form"><input id="search" type="search" data-t-placeholder="searchPlaceholder" placeholder="ابحث في المواضيع والأعضاء"><button class="cta" data-t="search">بحث</button></form><button class="cta" id="new-topic" data-t="newTopic">＋ موضوع جديد</button></section>
+    <div class="layout">
+      <section class="panel"><div class="panel-head"><h2 id="view-title" data-t="latest">أحدث النقاشات</h2><select id="category-filter" aria-label="Category"><option value="" data-t="allCategories">كل الأقسام</option><option value="programming" data-t="programming">البرمجة</option><option value="learning" data-t="learning">التعلّم</option><option value="general" data-t="general">نقاش عام</option></select></div><div id="content"><div class="empty" data-t="loading">جاري التحميل…</div></div></section>
+      <aside class="side">
+        <section class="side-card"><h3 data-t="joinTitle">شاركنا النقاش</h3><p class="muted" data-t="joinText">أنشئ حسابًا لتكتب موضوعًا وترد على الأعضاء.</p><button class="cta full" id="join-button" data-t="join">إنشاء حساب</button></section>
+        <section class="side-card" id="categories"><h3 data-t="categories">الأقسام</h3><a class="category" href="#category/programming"><span data-t="programming">البرمجة</span></a><a class="category" href="#category/learning"><span data-t="learning">التعلّم</span></a><a class="category" href="#category/general"><span data-t="general">نقاش عام</span></a></section>
+        <section class="side-card welcome"><div class="welcome-icon">🌱</div><h3 data-t="welcomeTitle">أهلًا في مساحة</h3><p data-t="welcomeText">مجتمع لطيف للأفكار والأسئلة والتعلّم. خليك محترم وخلي النقاش مفيد للجميع.</p></section>
+        <section class="side-card admin-card" id="admin-panel" hidden><h3 data-t="reports">بلاغات للإدارة</h3><div id="reports-list"></div></section>
+      </aside>
+    </div>
+    <footer class="footer" data-t="footer">مساحة — مكان للنقاش وتبادل الأفكار باحترام.</footer>
+  </main>
+  <dialog id="auth-dialog" class="dialog"><form method="dialog" class="dialog-close"><button aria-label="Close">×</button></form><div class="auth-tabs"><button id="login-tab" class="active" data-t="login">دخول</button><button id="register-tab" data-t="register">إنشاء حساب</button></div><form id="auth-form"><h2 id="auth-title" data-t="login">تسجيل الدخول</h2><label class="field" id="name-field" hidden><span data-t="displayName">الاسم الظاهر</span><input id="auth-name" name="displayName" minlength="2" maxlength="50" autocomplete="name"></label><label class="field"><span data-t="email">البريد الإلكتروني</span><input name="email" type="email" required autocomplete="email"></label><label class="field"><span data-t="password">كلمة المرور (10 أحرف على الأقل)</span><input name="password" type="password" required minlength="10" autocomplete="current-password"></label><p class="hint" data-t="authHint">كلمة المرور تُحفظ مشفّرة على الخادم.</p><button class="cta full" id="auth-submit" data-t="login">دخول</button><p class="form-error" id="auth-error" role="alert"></p></form></dialog>
+  <dialog id="topic-dialog" class="dialog"><form method="dialog" class="dialog-close"><button aria-label="Close">×</button></form><h2 data-t="newTopic">موضوع جديد</h2><form id="topic-form"><label class="field"><span data-t="titleLabel">العنوان</span><input name="title" required maxlength="120"></label><label class="field"><span data-t="bodyLabel">الموضوع</span><textarea name="body" required maxlength="5000" rows="6"></textarea></label><label class="field"><span data-t="categoryLabel">القسم</span><select name="category"><option value="programming" data-t="programming">البرمجة</option><option value="learning" data-t="learning">التعلّم</option><option value="general" data-t="general">نقاش عام</option></select></label><button class="cta full" data-t="publish">نشر</button><p class="form-error" id="topic-error"></p></form></dialog>
+  <dialog id="report-dialog" class="dialog"><form method="dialog" class="dialog-close"><button aria-label="Close">×</button></form><h2 data-t="reportTitle">الإبلاغ عن محتوى</h2><form id="report-form"><label class="field"><span data-t="reportReason">سبب البلاغ</span><textarea name="reason" required maxlength="500" rows="4"></textarea></label><button class="cta full" data-t="sendReport">إرسال البلاغ</button></form></dialog>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js" defer></script>
+</body></html>
