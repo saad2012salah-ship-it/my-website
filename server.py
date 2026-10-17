@@ -7,10 +7,13 @@ import mimetypes
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
+import ssl
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from http import cookies
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +27,50 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
 SESSION_SECONDS = 14 * 24 * 60 * 60
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+
+
+def send_email(to, subject, body):
+    if not SMTP_HOST or not SMTP_FROM:
+        return False
+    message = EmailMessage()
+    message["From"] = SMTP_FROM
+    message["To"] = to
+    message["Subject"] = subject
+    message.set_content(body)
+    context = ssl.create_default_context()
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=15) as smtp:
+            if SMTP_USER: smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            smtp.starttls(context=context)
+            if SMTP_USER: smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(message)
+    return True
+
+
+def issue_verification_code(db, user):
+    current = now()
+    previous = db.execute("SELECT created_at FROM verification_tokens WHERE user_id=?", (user["id"],)).fetchone()
+    if previous and previous["created_at"] > current - 60:
+        return False
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
+    db.execute("INSERT INTO verification_tokens(token_hash,user_id,expires_at,attempts,created_at) VALUES(?,?,?,?,?)",
+               (hashlib.sha256(code.encode()).hexdigest(), user["id"], current+600, 0, current))
+    try:
+        sent = send_email(user["email"], "Your Masaha verification code", f"Your verification code is {code}. It expires in 10 minutes.")
+    except Exception as exc:
+        print("Verification email failed:", repr(exc)); sent = False
+    if not sent:
+        print(f"Email verification code for {user['email']} (valid for 10 minutes): {code}")
+    return True
 
 
 @contextmanager
@@ -49,7 +96,8 @@ def init_db():
           display_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
           password_hash TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '',
           role TEXT NOT NULL DEFAULT 'member', created_at INTEGER NOT NULL,
-          avatar_url TEXT NOT NULL DEFAULT '', is_banned INTEGER NOT NULL DEFAULT 0
+          avatar_url TEXT NOT NULL DEFAULT '', is_banned INTEGER NOT NULL DEFAULT 0,
+          email_verified INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS sessions (
           token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -91,6 +139,11 @@ def init_db():
           token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           expires_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS verification_tokens (
+          token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase ON users(username COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS topics_created ON topics(created_at DESC);
         CREATE INDEX IF NOT EXISTS comments_topic ON comments(topic_id, created_at);
@@ -100,11 +153,17 @@ def init_db():
         for table, name, declaration in (
             ("users", "avatar_url", "TEXT NOT NULL DEFAULT ''"),
             ("users", "is_banned", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "email_verified", "INTEGER NOT NULL DEFAULT 0"),
             ("topics", "image_url", "TEXT NOT NULL DEFAULT ''"),
         ):
             columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
             if name not in columns:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        verify_columns = {row[1] for row in db.execute("PRAGMA table_info(verification_tokens)")}
+        if "attempts" not in verify_columns:
+            db.execute("ALTER TABLE verification_tokens ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "created_at" not in verify_columns:
+            db.execute("ALTER TABLE verification_tokens ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
 
 
 def now():
@@ -195,7 +254,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
             return None
         digest = hashlib.sha256(token.encode()).hexdigest()
         row = db.execute("""SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
-                          WHERE s.token_hash=? AND s.expires_at>?""", (digest, now())).fetchone()
+                          WHERE s.token_hash=? AND s.expires_at>? AND u.email_verified=1""", (digest, now())).fetchone()
         return row
 
     def require_user(self, db):
@@ -266,6 +325,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 search = query.get("q", [""])[0].strip()[:100]
                 category = query.get("category", [""])[0]
+                sort = query.get("sort", ["newest"])[0]
                 viewer = self.session_user(db)
                 sql = """SELECT t.*, u.username, u.display_name,u.avatar_url AS author_avatar,
                          (SELECT COUNT(*) FROM comments c WHERE c.topic_id=t.id) AS comment_count,
@@ -280,7 +340,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     values.extend([needle, needle, needle])
                 if category in ("programming", "learning", "general"):
                     sql += " AND t.category=?"; values.append(category)
-                sql += " ORDER BY t.created_at DESC LIMIT 100"
+                if sort == "popular":
+                    sql += " ORDER BY like_count DESC,t.created_at DESC LIMIT 100"
+                elif sort == "oldest":
+                    sql += " ORDER BY t.created_at ASC LIMIT 100"
+                else:
+                    sql += " ORDER BY t.created_at DESC LIMIT 100"
                 rows = db.execute(sql, values).fetchall()
                 return self.send_json(200, {"topics": [self.topic_json(row) for row in rows]})
             if path.startswith("/api/topics/") and path.count("/") == 3:
@@ -341,6 +406,34 @@ class ForumHandler(SimpleHTTPRequestHandler):
         try:
             data = self.read_json()
             with connect() as db:
+                if path == "/api/verify":
+                    email = str(data.get("email", "")).strip().lower()
+                    code = str(data.get("code", "")).strip()
+                    user = db.execute("SELECT * FROM users WHERE email=? AND email_verified=0", (email,)).fetchone()
+                    row = db.execute("SELECT * FROM verification_tokens WHERE user_id=? AND expires_at>?", (user["id"], now())).fetchone() if user else None
+                    if not row:
+                        return self.send_json(400, {"error": "CODE_INVALID"})
+                    if row["attempts"] >= 5:
+                        db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
+                        return self.send_json(400, {"error": "CODE_EXPIRED"})
+                    digest = hashlib.sha256(code.encode()).hexdigest()
+                    if not hmac.compare_digest(digest, row["token_hash"]):
+                        attempts = row["attempts"] + 1
+                        if attempts >= 5:
+                            db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
+                            return self.send_json(400, {"error": "CODE_EXPIRED"})
+                        db.execute("UPDATE verification_tokens SET attempts=? WHERE user_id=?", (attempts, user["id"]))
+                        return self.send_json(400, {"error": "CODE_INVALID"})
+                    db.execute("UPDATE users SET email_verified=1 WHERE id=?", (user["id"],))
+                    if ADMIN_EMAIL and email == ADMIN_EMAIL:
+                        db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
+                    db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
+                    return self.send_json(200, {"ok": True})
+                if path == "/api/verification-resend":
+                    email = str(data.get("email", "")).strip().lower()
+                    user = db.execute("SELECT * FROM users WHERE email=? AND email_verified=0", (email,)).fetchone()
+                    if user: issue_verification_code(db, user)
+                    return self.send_json(200, {"sent": True})
                 if path == "/api/register":
                     name = str(data.get("displayName", "")).strip()[:50]
                     username = str(data.get("username", "")).strip().lower()
@@ -355,19 +448,16 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     salt = secrets.token_bytes(16)
                     digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
                     encoded = "scrypt$" + salt.hex() + "$" + digest.hex()
-                    role = "admin" if ADMIN_EMAIL and email == ADMIN_EMAIL else "member"
                     try:
-                        cur = db.execute("INSERT INTO users(username,display_name,email,password_hash,role,created_at) VALUES(?,?,?,?,?,?)",
-                                         (username, name, email, encoded, role, now()))
+                        cur = db.execute("INSERT INTO users(username,display_name,email,password_hash,role,created_at,email_verified) VALUES(?,?,?,?,?,?,0)",
+                                         (username, name, email, encoded, "member", now()))
                     except sqlite3.IntegrityError:
                         if db.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone():
                             return self.send_json(409, {"error": "USERNAME_TAKEN"})
                         return self.send_json(409, {"error": "That email is already registered"})
                     user = db.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
-                    token = secrets.token_urlsafe(32)
-                    db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)",
-                               (hashlib.sha256(token.encode()).hexdigest(), user["id"], now()+SESSION_SECONDS))
-                    return self.send_json(201, {"user": public_user(user)}, self.cookie_headers(token, SESSION_SECONDS))
+                    issue_verification_code(db, user)
+                    return self.send_json(201, {"verificationRequired": True})
                 if path == "/api/login":
                     email = str(data.get("email", "")).strip().lower()
                     password = str(data.get("password", ""))
@@ -382,6 +472,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                             pass
                     if not valid:
                         return self.send_json(401, {"error": "Email or password is incorrect"})
+                    if not user["email_verified"]:
+                        issue_verification_code(db, user)
+                        return self.send_json(403, {"error": "EMAIL_NOT_VERIFIED"})
                     if ADMIN_EMAIL and email == ADMIN_EMAIL and user["role"] != "admin":
                         db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
                         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -403,7 +496,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         db.execute("DELETE FROM reset_tokens WHERE user_id=?", (account["id"],))
                         db.execute("INSERT INTO reset_tokens(token_hash,user_id,expires_at) VALUES(?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), account["id"], now()+3600))
                         base = SITE_URL or f"http://127.0.0.1:{PORT}"
-                        print(f"Password reset link (valid for 1 hour): {base}/?reset={token}")
+                        link = f"{base}/?reset={token}"
+                        try:
+                            sent = send_email(email, "Reset your Masaha password", f"Open this link within one hour to reset your password:\n\n{link}")
+                        except Exception as exc:
+                            print("Password reset email failed:", repr(exc)); sent = False
+                        if not sent: print(f"Password reset link (valid for 1 hour): {link}")
                     return self.send_json(200, {"ok": True})
                 if path == "/api/reset-password":
                     token = str(data.get("token", ""))
@@ -494,6 +592,17 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if not exists: return self.send_json(404, {"error": "Content not found"})
                     db.execute("INSERT INTO reports(reporter_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?)",
                                (user["id"], kind, target_id, reason, now()))
+                    if ADMIN_EMAIL:
+                        if kind == "topic":
+                            item = db.execute("SELECT title FROM topics WHERE id=?", (target_id,)).fetchone()
+                            target_label = f"Topic #{target_id}: {item['title']}"
+                        else:
+                            item = db.execute("SELECT c.topic_id,t.title FROM comments c JOIN topics t ON t.id=c.topic_id WHERE c.id=?", (target_id,)).fetchone()
+                            target_label = f"Reply #{target_id} on topic #{item['topic_id']} ({item['title']})"
+                        try:
+                            send_email(ADMIN_EMAIL, "New report on Masaha", f"Reporter: {user['display_name']} (@{user['username']})\nTarget: {target_label}\nReason: {reason}\n")
+                        except Exception as exc:
+                            print("Report notification email failed:", repr(exc))
                     return self.send_json(201, {"ok": True})
                 if path.startswith("/api/topics/") and path.endswith("/delete"):
                     if not self.require_admin(user): return
@@ -523,7 +632,28 @@ class ForumHandler(SimpleHTTPRequestHandler):
         return self.send_json(404, {"error": "API route not found"})
 
     def do_PUT(self):
-        if urlparse(self.path).path != "/api/me/profile":
+        path = urlparse(self.path).path
+        if path.startswith("/api/admin/topics/"):
+            try:
+                topic_id = int(path.rsplit("/", 1)[1])
+                data = self.read_json()
+                with connect() as db:
+                    user = self.require_user(db)
+                    if not user or not self.require_admin(user): return
+                    title = str(data.get("title", "")).strip()
+                    body = str(data.get("body", "")).strip()
+                    category = str(data.get("category", "general"))
+                    if not title or len(title) > 120 or not body or len(body) > 5000 or category not in ("programming", "learning", "general"):
+                        return self.send_json(400, {"error": "Check the title, message, and category"})
+                    cur = db.execute("UPDATE topics SET title=?,body=?,category=? WHERE id=? AND deleted=0", (title, body, category, topic_id))
+                    if not cur.rowcount: return self.send_json(404, {"error": "Topic not found"})
+                    return self.send_json(200, {"ok": True})
+            except ValueError as exc:
+                return self.send_json(400, {"error": str(exc)})
+            except Exception as exc:
+                print("Request error:", repr(exc))
+                return self.send_json(500, {"error": "Server error"})
+        if path != "/api/me/profile":
             return self.send_json(404, {"error": "API route not found"})
         try:
             data = self.read_json()
