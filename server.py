@@ -17,8 +17,8 @@ from urllib.parse import urlparse, parse_qs
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("MASAHA_DB", ROOT / "masaha.sqlite3"))
-HOST = os.environ.get("HOST", "127.0.0.1")
-PORT = int(os.environ.get("PORT", "8000"))
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "10000"))
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
 SESSION_SECONDS = 14 * 24 * 60 * 60
