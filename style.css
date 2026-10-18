@@ -13,3 +13,5 @@
 @media(max-width:760px){.mobile-menu{display:inline-block}.navlinks{display:none;position:absolute;inset-inline-end:10px;top:66px;z-index:12;background:white;border:1px solid var(--line);border-radius:12px;padding:12px;box-shadow:var(--shadow);min-width:190px}.navlinks.open{display:grid;gap:8px}.navlinks a,.navlinks button{display:block;padding:8px 10px;text-align:start;margin:0}.nav-actions{gap:6px}.nav-actions button,.nav-actions .quiet{padding:7px 8px}.profile-cover{height:140px}}
 @media(max-width:520px){.nav{gap:6px}.brand{font-size:16px}.logo{width:32px;height:32px}.nav-actions{gap:4px}.nav-actions button,.nav-actions .quiet{font-size:11px;padding:6px}.profile-cover{height:110px}.report-page .panel-head{align-items:flex-start;flex-direction:column}.inline-field select{max-width:100%}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+
+.report-management-link{display:block;text-align:center;text-decoration:none;margin-bottom:18px}

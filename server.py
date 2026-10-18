@@ -21,9 +21,42 @@ from http import cookies
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-
 ROOT = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("MASAHA_DB", ROOT / "masaha.sqlite3"))
+DB_URL = os.environ.get("MASAHA_DB", "")
+
+if DB_URL.startswith("postgres://") or DB_URL.startswith("postgresql://"):
+    import psycopg2
+    import psycopg2.extras
+    
+    class PostgresConnectionWrapper:
+        def __init__(self, url):
+            self.conn = psycopg2.connect(url, sslmode='require')
+            self.conn.autocommit = True
+            
+        def cursor(self):
+            return self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            
+        def commit(self):
+            self.conn.commit()
+            
+        def close(self):
+            self.conn.close()
+            
+        def __enter__(self):
+            return self
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.close()
+
+    def get_db():
+        return PostgresConnectionWrapper(DB_URL)
+else:
+    DB_PATH = Path(DB_URL if DB_URL else ROOT / "masaha.sqlite3")
+    
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "10000"))
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
@@ -529,7 +562,10 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path == "/api/verification-resend":
                     email = str(data.get("email", "")).strip().lower()
                     user = db.execute("SELECT * FROM users WHERE email=? AND email_verified=0", (email,)).fetchone()
-                    if user: issue_verification_code(db, user)
+                    if user and not issue_verification_code(db, user):
+                        previous = db.execute("SELECT created_at FROM verification_tokens WHERE user_id=?", (user["id"],)).fetchone()
+                        retry_after = max(1, 60 - (now() - previous["created_at"])) if previous else 60
+                        return self.send_json(429, {"error": "RESEND_COOLDOWN", "retryAfter": retry_after})
                     return self.send_json(200, {"sent": True})
                 if path == "/api/register":
                     name = str(data.get("displayName", "")).strip()[:50]
@@ -685,7 +721,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         encoded = "scrypt$" + salt.hex() + "$" + hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1).hex()
                         db.execute("UPDATE users SET password_hash=? WHERE id=?", (encoded, user["id"]))
                     raw_cookie = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-                    if "masaha_session" in raw_cookie:
+                    if email != user["email"]:
+                        db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+                    elif "masaha_session" in raw_cookie:
                         current_hash = hashlib.sha256(raw_cookie["masaha_session"].value.encode()).hexdigest()
                         db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user["id"], current_hash))
                     if email != user["email"]:
@@ -694,7 +732,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         issue_verification_code(db, updated)
                     updated = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
                     response_user = public_user(updated); response_user["email"] = updated["email"]
-                    return self.send_json(200, {"ok": True, "verificationRequired": email != user["email"], "user": response_user})
+                    response = {"ok": True, "verificationRequired": email != user["email"], "user": response_user}
+                    headers = self.cookie_headers("", 0) if email != user["email"] else None
+                    return self.send_json(200, response, headers)
                 if path == "/api/topics":
                     title = str(data.get("title", "")).strip()
                     body = str(data.get("body", "")).strip()
