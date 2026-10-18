@@ -104,7 +104,7 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "10000"))
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
-SESSION_SECONDS = 14 * 24 * 60 * 60
+SESSION_SECONDS = 90 * 24 * 60 * 60
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -490,7 +490,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
         c["masaha_session"] = token or ""
         c["masaha_session"]["path"] = "/"
         c["masaha_session"]["httponly"] = True
-        c["masaha_session"]["samesite"] = "Strict"
+        c["masaha_session"]["samesite"] = "Lax"
         c["masaha_session"]["max-age"] = str(max_age)
         if COOKIE_SECURE:
             c["masaha_session"]["secure"] = True
@@ -831,7 +831,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path == "/api/login":
                     email = str(data.get("email", "")).strip().lower()
                     password = str(data.get("password", ""))
-                    user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+                    user = db.execute("SELECT * FROM users WHERE lower(email)=? OR lower(username)=?", (email, email)).fetchone()
                     valid = False
                     if user:
                         try:
@@ -842,7 +842,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                             pass
                     if not valid:
                         return self.send_json(401, {"error": "Email or password is incorrect"})
-                    if ADMIN_EMAIL and email == ADMIN_EMAIL and user["role"] != "admin":
+                    if ADMIN_EMAIL and user["email"].lower() == ADMIN_EMAIL and user["role"] != "admin":
                         db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
                         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
                     token = secrets.token_urlsafe(32)
@@ -1133,10 +1133,14 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path.startswith("/api/topics/") and path.endswith("/delete"):
                     try: topic_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
-                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    # Make repeat delete requests safe (for example, a double click
+                    # or an old moderation report pointing at an already removed topic).
+                    topic = db.execute("SELECT user_id,deleted FROM topics WHERE id=?", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
                     if user["role"] != "admin" and topic["user_id"] != user["id"]:
                         return self.send_json(403, {"error": "Only the author or an admin can remove this topic"})
+                    if topic["deleted"]:
+                        return self.send_json(200, {"ok": True, "alreadyDeleted": True})
                     db.execute("UPDATE topics SET deleted=1 WHERE id=?", (topic_id,))
                     db.execute("UPDATE reports SET status='resolved' WHERE target_type='topic' AND target_id=?", (topic_id,))
                     if user["role"]=="admin": db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"delete","topic",topic_id,"Topic removed",now()))
