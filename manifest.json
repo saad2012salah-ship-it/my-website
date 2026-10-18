@@ -1,0 +1,13 @@
+{
+  "name": "مساحة | منتدى للنقاش",
+  "short_name": "مساحة",
+  "description": "مجتمع عربي وإنجليزي للنقاش وتبادل الأفكار.",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f7fc",
+  "theme_color": "#5b4bd8",
+  "icons": [{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}
