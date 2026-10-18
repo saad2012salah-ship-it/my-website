@@ -23,7 +23,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 ROOT = Path(__file__).resolve().parent
-DB_URL = os.environ.get("MASAHA_DB", os.environ.get("DATABASE_URL", "")).strip()
+DB_URL = (os.environ.get("MASAHA_DB") or os.environ.get("DATABASE_URL") or "").strip()
 USE_POSTGRES = DB_URL.startswith(("postgres://", "postgresql://"))
 
 if USE_POSTGRES:
@@ -550,6 +550,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 return self.send_error(404)
             return super().do_GET()
         with connect() as db:
+            if path == "/api/health":
+                db.execute("SELECT 1").fetchone()
+                return self.send_json(200, {"ok": True, "database": "postgresql" if USE_POSTGRES else "sqlite"})
             if path == "/api/categories":
                 viewer = self.session_user(db)
                 rows = db.execute("""SELECT c.slug,c.name_ar,c.name_en,c.description,
@@ -735,6 +738,23 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     JOIN users u ON u.id=c.user_id WHERE c.topic_id=? ORDER BY c.created_at""", (topic_id,)).fetchall()
                 return self.send_json(200, {"topic": self.topic_json(topic), "comments": [self.comment_json(x) for x in comments],
                                             "poll": poll_details(db, topic_id, viewer["id"] if viewer else None)})
+            if path == "/api/members":
+                query = parse_qs(parsed.query)
+                search = query.get("q", [""])[0].strip()[:80]
+                try:
+                    limit = min(max(int(query.get("limit", ["50"])[0]), 1), 100)
+                except ValueError:
+                    limit = 50
+                params = []
+                where = ""
+                if search:
+                    where = "WHERE display_name LIKE ? OR username LIKE ?"
+                    needle = "%" + search + "%"
+                    params.extend([needle, needle])
+                params.append(limit)
+                rows = db.execute("""SELECT id,username,display_name,bio,role,created_at,avatar_url,cover_url
+                    FROM users """ + where + " ORDER BY created_at DESC LIMIT ?", params).fetchall()
+                return self.send_json(200, {"members": [public_user(row) for row in rows]})
             if path.startswith("/api/users/"):
                 try: user_id = int(path.rsplit("/", 1)[1])
                 except ValueError: return self.send_json(400, {"error": "Invalid user id"})
