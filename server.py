@@ -116,6 +116,8 @@ BACKUP_DIR = Path(os.environ.get("MASAHA_BACKUP_DIR", ROOT / "backups"))
 BACKUP_INTERVAL = max(3600, int(os.environ.get("MASAHA_BACKUP_INTERVAL", "86400")))
 BACKUP_KEEP = max(1, int(os.environ.get("MASAHA_BACKUP_KEEP", "7")))
 BACKUP_BUCKET = os.environ.get("MASAHA_BACKUP_BUCKET", "").rstrip("/")
+BACKUP_STATE = {"status": "idle", "updatedAt": None, "error": ""}
+BACKUP_STATE_LOCK = threading.Lock()
 
 
 def send_email(to, subject, body):
@@ -221,8 +223,12 @@ def backup_worker():
     while True:
         time.sleep(BACKUP_INTERVAL)
         try:
-            backup_database()
+            target = backup_database()
+            with BACKUP_STATE_LOCK:
+                BACKUP_STATE.update(status="success", updatedAt=int(target.stat().st_mtime), error="")
         except Exception as exc:
+            with BACKUP_STATE_LOCK:
+                BACKUP_STATE.update(status="error", updatedAt=now(), error=str(exc)[:300])
             print("Scheduled database backup failed:", repr(exc))
 
 
@@ -253,8 +259,10 @@ def init_db():
           display_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
           password_hash TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '',
           role TEXT NOT NULL DEFAULT 'member', created_at INTEGER NOT NULL,
-          avatar_url TEXT NOT NULL DEFAULT '', is_banned INTEGER NOT NULL DEFAULT 0,
-          email_verified INTEGER NOT NULL DEFAULT 0, cover_url TEXT NOT NULL DEFAULT ''
+          avatar_url TEXT NOT NULL DEFAULT '', is_banned INTEGER NOT NULL DEFAULT 0, ban_until INTEGER,
+          email_verified INTEGER NOT NULL DEFAULT 0, cover_url TEXT NOT NULL DEFAULT '',
+          notification_preferences TEXT NOT NULL DEFAULT '{"replies":true,"likes":true,"follows":true}',
+          website TEXT NOT NULL DEFAULT '', interests TEXT NOT NULL DEFAULT '[]', profile_visibility TEXT NOT NULL DEFAULT 'public'
         );
         CREATE TABLE IF NOT EXISTS sessions (
           token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -264,8 +272,9 @@ def init_db():
           id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           title TEXT NOT NULL, body TEXT NOT NULL, category TEXT NOT NULL,
           created_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
-          image_url TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]',
-          is_pinned INTEGER NOT NULL DEFAULT 0, poll_json TEXT NOT NULL DEFAULT ''
+          image_url TEXT NOT NULL DEFAULT '', image_urls TEXT NOT NULL DEFAULT '[]', tags TEXT NOT NULL DEFAULT '[]',
+          is_pinned INTEGER NOT NULL DEFAULT 0, poll_json TEXT NOT NULL DEFAULT '',
+          is_hidden INTEGER NOT NULL DEFAULT 0, hidden_until INTEGER, hidden_reason TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS categories (
           slug TEXT PRIMARY KEY, name_ar TEXT NOT NULL, name_en TEXT NOT NULL,
@@ -274,7 +283,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS comments (
           id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          body TEXT NOT NULL, created_at INTEGER NOT NULL
+          body TEXT NOT NULL, created_at INTEGER NOT NULL, is_pinned INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS direct_messages (
           id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -290,6 +299,10 @@ def init_db():
           id INTEGER PRIMARY KEY, reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           target_type TEXT NOT NULL, target_id INTEGER NOT NULL, reason TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS member_notes (
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          admin_id INTEGER NOT NULL REFERENCES users(id), note TEXT NOT NULL, created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS likes (
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -363,13 +376,23 @@ def init_db():
         for table, name, declaration in (
             ("users", "avatar_url", "TEXT NOT NULL DEFAULT ''"),
             ("users", "is_banned", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "ban_until", "INTEGER"),
             ("users", "email_verified", "INTEGER NOT NULL DEFAULT 0"),
             ("users", "cover_url", "TEXT NOT NULL DEFAULT ''"),
+            ("users", "notification_preferences", "TEXT NOT NULL DEFAULT '{\"replies\":true,\"likes\":true,\"follows\":true}'"),
+            ("users", "website", "TEXT NOT NULL DEFAULT ''"),
+            ("users", "interests", "TEXT NOT NULL DEFAULT '[]'"),
+            ("users", "profile_visibility", "TEXT NOT NULL DEFAULT 'public'"),
+            ("topics", "image_urls", "TEXT NOT NULL DEFAULT '[]'"),
+            ("comments", "is_pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("topics", "image_url", "TEXT NOT NULL DEFAULT ''"),
             ("topics", "tags", "TEXT NOT NULL DEFAULT '[]'"),
             ("topics", "is_pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("topics", "poll_json", "TEXT NOT NULL DEFAULT ''"),
             ("topics", "best_answer_id", "INTEGER"),
+            ("topics", "is_hidden", "INTEGER NOT NULL DEFAULT 0"),
+            ("topics", "hidden_until", "INTEGER"),
+            ("topics", "hidden_reason", "TEXT NOT NULL DEFAULT ''"),
         ):
             columns = db.columns(table) if USE_POSTGRES else {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
             if name not in columns:
@@ -386,9 +409,9 @@ def now():
 
 
 def member_metrics(db, user_id):
-    topic_count = db.execute("SELECT COUNT(*) FROM topics WHERE user_id=? AND deleted=0", (user_id,)).fetchone()[0]
+    topic_count = db.execute("SELECT COUNT(*) FROM topics WHERE user_id=? AND deleted=0 AND is_hidden=0", (user_id,)).fetchone()[0]
     reply_count = db.execute("SELECT COUNT(*) FROM comments WHERE user_id=?", (user_id,)).fetchone()[0]
-    likes_received = db.execute("SELECT COUNT(*) FROM likes l JOIN topics t ON t.id=l.topic_id WHERE t.user_id=? AND t.deleted=0", (user_id,)).fetchone()[0]
+    likes_received = db.execute("SELECT COUNT(*) FROM likes l JOIN topics t ON t.id=l.topic_id WHERE t.user_id=? AND t.deleted=0 AND is_hidden=0", (user_id,)).fetchone()[0]
     points = topic_count * 10 + reply_count * 3 + likes_received * 2
     badges = []
     if topic_count: badges.append("first_topic")
@@ -421,8 +444,19 @@ def public_user(row):
             "role": row["role"], "createdAt": row["created_at"],
             "avatarUrl": row["avatar_url"] if "avatar_url" in row.keys() else "",
             "coverUrl": row["cover_url"] if "cover_url" in row.keys() else "",
+            "website": row["website"] if "website" in row.keys() else "",
+            "interests": json.loads(row["interests"] or "[]") if "interests" in row.keys() else [],
+            "profileVisibility": row["profile_visibility"] if "profile_visibility" in row.keys() else "public",
             "is_banned": row["is_banned"] if "is_banned" in row.keys() else 0}
 
+
+
+def notification_enabled(db, recipient_id, kind):
+    row = db.execute("SELECT notification_preferences FROM users WHERE id=?", (recipient_id,)).fetchone()
+    try: prefs = json.loads(row["notification_preferences"] or "{}") if row else {}
+    except (ValueError, TypeError): prefs = {}
+    key = "likes" if kind == "like" else "follows" if kind == "followed_topic" else "replies"
+    return bool(prefs.get(key, True))
 
 def normalize_tags(value):
     values = value if isinstance(value, list) else str(value or "").split(",")
@@ -479,7 +513,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
             size = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             raise ValueError("Invalid content length")
-        if size > 3_000_000:
+        if size > 12_000_000:
             raise ValueError("Request is too large")
         raw = self.rfile.read(size)
         try:
@@ -520,13 +554,24 @@ class ForumHandler(SimpleHTTPRequestHandler):
             self.send_json(401, {"error": "Please log in first"})
             return None
         if user["is_banned"]:
-            self.send_json(403, {"error": "This account is suspended"})
-            return None
+            until = user["ban_until"] if "ban_until" in user.keys() else None
+            if until and until <= now():
+                db.execute("UPDATE users SET is_banned=0,ban_until=NULL WHERE id=?", (user["id"],))
+                user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            else:
+                self.send_json(403, {"error": "This account is suspended", "banUntil": until})
+                return None
         return user
 
     def require_admin(self, user):
         if not user or user["role"] != "admin":
             self.send_json(403, {"error": "Admin access required"})
+            return False
+        return True
+
+    def require_staff(self, user):
+        if not user or user["role"] not in ("admin", "moderator"):
+            self.send_json(403, {"error": "Moderator access required"})
             return False
         return True
 
@@ -542,7 +587,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     self.send_error(503, "Set SITE_URL to your public https URL before submitting a sitemap")
                     return
                 with connect() as db:
-                    ids = [row[0] for row in db.execute("SELECT id FROM topics WHERE deleted=0 ORDER BY created_at DESC LIMIT 50000")]
+                    ids = [row[0] for row in db.execute("SELECT id FROM topics WHERE deleted=0 AND is_hidden=0 ORDER BY created_at DESC LIMIT 50000")]
                 locs = [f"<url><loc>{SITE_URL}/</loc></url>"] + [f"<url><loc>{SITE_URL}/?topic={topic_id}</loc></url>" for topic_id in ids]
                 body = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" + "".join(locs) + "</urlset>").encode()
                 self.send_response(200); self.send_header("Content-Type", "application/xml; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
@@ -550,6 +595,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 return self.send_error(404)
             return super().do_GET()
         with connect() as db:
+            db.execute("UPDATE topics SET is_hidden=0,hidden_until=NULL,hidden_reason='' WHERE is_hidden=1 AND hidden_until IS NOT NULL AND hidden_until<=?", (now(),))
             if path == "/api/health":
                 db.execute("SELECT 1").fetchone()
                 return self.send_json(200, {"ok": True, "database": "postgresql" if USE_POSTGRES else "sqlite"})
@@ -557,7 +603,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 viewer = self.session_user(db)
                 rows = db.execute("""SELECT c.slug,c.name_ar,c.name_en,c.description,
                     COUNT(t.id) AS topic_count FROM categories c LEFT JOIN topics t
-                    ON t.category=c.slug AND t.deleted=0 GROUP BY c.slug,c.name_ar,c.name_en,c.description
+                    ON t.category=c.slug AND t.deleted=0 AND is_hidden=0 GROUP BY c.slug,c.name_ar,c.name_en,c.description
                     ORDER BY c.created_at,c.slug""").fetchall()
                 categories = [dict(row) for row in rows]
                 if viewer:
@@ -567,11 +613,40 @@ class ForumHandler(SimpleHTTPRequestHandler):
             if path == "/api/me":
                 current = self.session_user(db)
                 profile = public_user(current)
-                if profile: profile["email"] = current["email"]
+                if profile:
+                    profile["email"] = current["email"]
+                    try: profile["notificationPreferences"] = json.loads(current["notification_preferences"] or "{}")
+                    except (ValueError, TypeError): profile["notificationPreferences"] = {"replies": True, "likes": True, "follows": True}
                 return self.send_json(200, {"user": profile})
+            if path == "/api/me/activity":
+                user = self.require_user(db)
+                if not user: return
+                uid = user["id"]
+                started = db.execute("""SELECT t.id,t.title,t.created_at AS activity_at,
+                    (SELECT COUNT(*) FROM comments c WHERE c.topic_id=t.id) AS reply_count
+                    FROM topics t WHERE t.user_id=? AND t.deleted=0 AND t.is_hidden=0
+                    ORDER BY t.created_at DESC LIMIT 8""", (uid,)).fetchall()
+                participated = db.execute("""SELECT t.id,t.title,MAX(c.created_at) AS activity_at,
+                    COUNT(c.id) AS reply_count FROM comments c JOIN topics t ON t.id=c.topic_id
+                    WHERE c.user_id=? AND t.deleted=0 AND t.is_hidden=0
+                    GROUP BY t.id,t.title ORDER BY activity_at DESC LIMIT 8""", (uid,)).fetchall()
+                new_replies = db.execute("""SELECT n.topic_id AS id,t.title,MAX(n.created_at) AS activity_at,
+                    COUNT(n.id) AS reply_count,MAX(a.display_name) AS actor
+                    FROM notifications n JOIN topics t ON t.id=n.topic_id JOIN users a ON a.id=n.actor_id
+                    WHERE n.user_id=? AND n.seen=0 AND n.kind IN ('reply','reply_comment')
+                    GROUP BY n.topic_id,t.title ORDER BY activity_at DESC LIMIT 8""", (uid,)).fetchall()
+                activity = db.execute("""SELECT * FROM (
+                    SELECT t.id AS topic_id,t.title AS title,t.created_at AS created_at,'topic' AS kind,'' AS body
+                    FROM topics t WHERE t.user_id=? AND t.deleted=0
+                    UNION ALL
+                    SELECT t.id AS topic_id,t.title AS title,c.created_at AS created_at,'reply' AS kind,c.body AS body
+                    FROM comments c JOIN topics t ON t.id=c.topic_id WHERE c.user_id=? AND t.deleted=0
+                ) ORDER BY created_at DESC LIMIT 30""", (uid,uid)).fetchall()
+                return self.send_json(200, {"started":[dict(x) for x in started],"participated":[dict(x) for x in participated],
+                    "newReplies":[dict(x) for x in new_replies],"activity":[dict(x) for x in activity]})
             if path == "/api/admin/moderation-log":
                 user=self.require_user(db)
-                if not user or not self.require_admin(user): return
+                if not user or not self.require_staff(user): return
                 rows=db.execute("SELECT l.*,u.display_name AS admin_name FROM moderation_log l JOIN users u ON u.id=l.admin_id ORDER BY l.created_at DESC LIMIT 100").fetchall()
                 return self.send_json(200,{"entries":[dict(r) for r in rows]})
             if path == "/api/inbox":
@@ -601,6 +676,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 search = query.get("q", [""])[0].strip()[:100]
                 category = query.get("category", [""])[0]
+                tag = query.get("tag", [""])[0].strip().lstrip("#")[:24]
+                try: since = max(0, int(query.get("since", ["0"])[0]))
+                except ValueError: since = 0
                 sort = query.get("sort", ["newest"])[0]
                 filters = ""
                 params = [user["id"], user["id"]]
@@ -609,6 +687,8 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     needle = "%" + search + "%"; params.extend([needle, needle, needle])
                 if category and db.execute("SELECT 1 FROM categories WHERE slug=?", (category,)).fetchone():
                     filters += " AND t.category=?"; params.append(category)
+                if tag: filters += " AND t.tags LIKE ?"; params.append("%\"" + tag + "\"%")
+                if since: filters += " AND t.created_at>=?"; params.append(since)
                 ordering = "t.is_pinned DESC,b.created_at DESC"
                 if sort == "popular": ordering = "t.is_pinned DESC,like_count DESC,t.created_at DESC"
                 elif sort == "oldest": ordering = "t.is_pinned DESC,t.created_at ASC"
@@ -617,7 +697,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     (SELECT COUNT(*) FROM likes l WHERE l.topic_id=t.id) AS like_count,
                     1 AS bookmarked_by_me, EXISTS(SELECT 1 FROM likes l WHERE l.topic_id=t.id AND l.user_id=?) AS liked_by_me
                     FROM bookmarks b JOIN topics t ON t.id=b.topic_id JOIN users u ON u.id=t.user_id
-                    WHERE b.user_id=? AND t.deleted=0""" + filters + " ORDER BY " + ordering, params).fetchall()
+                    WHERE b.user_id=? AND t.deleted=0 AND is_hidden=0""" + filters + " ORDER BY " + ordering, params).fetchall()
                 return self.send_json(200, {"topics": [self.topic_json(row) for row in rows]})
             if path == "/api/notifications":
                 user = self.require_user(db)
@@ -640,14 +720,14 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     EXISTS(SELECT 1 FROM likes l WHERE l.topic_id=t.id AND l.user_id=?) AS liked_by_me,
                     EXISTS(SELECT 1 FROM bookmarks b WHERE b.topic_id=t.id AND b.user_id=?) AS bookmarked_by_me
                     FROM topics t JOIN users u ON u.id=t.user_id
-                    WHERE t.deleted=0 AND (EXISTS(SELECT 1 FROM user_follows f WHERE f.follower_id=? AND f.followed_id=t.user_id)
+                    WHERE t.deleted=0 AND is_hidden=0 AND (EXISTS(SELECT 1 FROM user_follows f WHERE f.follower_id=? AND f.followed_id=t.user_id)
                     OR EXISTS(SELECT 1 FROM category_follows cf WHERE cf.user_id=? AND cf.category_slug=t.category))
                     ORDER BY t.is_pinned DESC,t.created_at DESC LIMIT 100""",
                     (viewer_id, viewer_id, viewer_id, viewer_id)).fetchall()
                 return self.send_json(200, {"topics": [self.topic_json(row) for row in rows]})
             if path == "/api/admin/users":
                 user = self.require_user(db)
-                if not user or not self.require_admin(user): return
+                if not user or not self.require_staff(user): return
                 query = parse_qs(parsed.query)
                 term = query.get("q", [""])[0].strip()[:100]
                 try:
@@ -655,19 +735,28 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     offset = max(0, int(query.get("offset", ["0"])[0]))
                 except ValueError:
                     limit, offset = 20, 0
-                where = " WHERE (username LIKE ? OR display_name LIKE ? OR email LIKE ?)" if term else ""
-                params = ([f"%{term}%"] * 3) if term else []
+                if term and user["role"] == "admin":
+                    where = " WHERE (username LIKE ? OR display_name LIKE ? OR email LIKE ?)"
+                    params = [f"%{term}%"] * 3
+                elif term:
+                    where = " WHERE (username LIKE ? OR display_name LIKE ?)"
+                    params = [f"%{term}%"] * 2
+                else:
+                    where, params = "", []
                 total = db.execute("SELECT COUNT(*) FROM users" + where, params).fetchone()[0]
-                rows = db.execute("SELECT id,username,display_name,email,role,is_banned,created_at FROM users" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
-                return self.send_json(200, {"users": [dict(row) for row in rows], "total": total})
+                rows = db.execute("SELECT id,username,display_name,email,role,is_banned,ban_until,created_at FROM users" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+                members = [dict(row) for row in rows]
+                if user["role"] != "admin":
+                    for member in members: member.pop("email", None)
+                return self.send_json(200, {"users": members, "total": total})
             if path.startswith("/api/admin/users/"):
                 user = self.require_user(db)
-                if not user or not self.require_admin(user): return
+                if not user or not self.require_staff(user): return
                 try: target_id = int(path.rsplit("/", 1)[1])
                 except ValueError: return self.send_json(400, {"error": "Invalid user id"})
-                target = db.execute("SELECT id,username,display_name,email,role,is_banned,bio,created_at FROM users WHERE id=?", (target_id,)).fetchone()
+                target = db.execute("SELECT id,username,display_name,email,role,is_banned,ban_until,bio,created_at FROM users WHERE id=?", (target_id,)).fetchone()
                 if not target: return self.send_json(404, {"error": "Member not found"})
-                topics = db.execute("SELECT id,title,created_at FROM topics WHERE user_id=? AND deleted=0 ORDER BY created_at DESC LIMIT 10", (target_id,)).fetchall()
+                topics = db.execute("SELECT id,title,created_at FROM topics WHERE user_id=? AND deleted=0 AND is_hidden=0 ORDER BY created_at DESC LIMIT 10", (target_id,)).fetchall()
                 replies = db.execute("SELECT c.id,c.body,c.created_at,t.id AS topic_id,t.title FROM comments c JOIN topics t ON t.id=c.topic_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT 10", (target_id,)).fetchall()
                 report_count = db.execute("SELECT COUNT(*) FROM reports r WHERE (r.target_type='topic' AND r.target_id IN (SELECT id FROM topics WHERE user_id=?)) OR (r.target_type='comment' AND r.target_id IN (SELECT id FROM comments WHERE user_id=?))", (target_id,target_id)).fetchone()[0]
                 reports = db.execute("""SELECT r.id,r.target_type,r.target_id,r.reason,r.status,r.created_at,
@@ -676,22 +765,71 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     FROM reports r WHERE (r.target_type='topic' AND r.target_id IN (SELECT id FROM topics WHERE user_id=?))
                     OR (r.target_type='comment' AND r.target_id IN (SELECT id FROM comments WHERE user_id=?))
                     ORDER BY r.created_at DESC LIMIT 20""", (target_id,target_id)).fetchall()
-                return self.send_json(200, {"user": dict(target), "topics": [dict(row) for row in topics], "replies": [dict(row) for row in replies], "reportsAgainst": report_count, "reports": [dict(row) for row in reports]})
+                notes = db.execute("SELECT n.id,n.note,n.created_at,u.display_name AS admin_name FROM member_notes n JOIN users u ON u.id=n.admin_id WHERE n.user_id=? ORDER BY n.created_at DESC LIMIT 100", (target_id,)).fetchall()
+                target_data = dict(target)
+                if user["role"] != "admin": target_data.pop("email", None)
+                return self.send_json(200, {"user": target_data, "topics": [dict(row) for row in topics], "replies": [dict(row) for row in replies], "reportsAgainst": report_count, "reports": [dict(row) for row in reports], "notes": [dict(row) for row in notes]})
             if path == "/api/admin/stats":
                 user = self.require_user(db)
-                if not user or not self.require_admin(user): return
+                if not user or not self.require_staff(user): return
                 stats = {
                     "members": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-                    "topics": db.execute("SELECT COUNT(*) FROM topics WHERE deleted=0").fetchone()[0],
+                    "topics": db.execute("SELECT COUNT(*) FROM topics WHERE deleted=0 AND is_hidden=0").fetchone()[0],
                     "replies": db.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
                     "openReports": db.execute("SELECT COUNT(*) FROM reports WHERE status='open'").fetchone()[0],
-                    "todayTopics": db.execute("SELECT COUNT(*) FROM topics WHERE created_at>=? AND deleted=0", (now()-86400,)).fetchone()[0],
+                    "todayTopics": db.execute("SELECT COUNT(*) FROM topics WHERE created_at>=? AND deleted=0 AND is_hidden=0", (now()-86400,)).fetchone()[0],
                 }
                 return self.send_json(200, {"stats": stats})
+            if path == "/api/admin/content":
+                user = self.require_user(db)
+                if not user or not self.require_staff(user): return
+                query = parse_qs(parsed.query)
+                term = query.get("q", [""])[0].strip()[:100]
+                state = query.get("state", ["all"])[0]
+                where = ""
+                params = []
+                if state == "hidden": where = "WHERE t.deleted=0 AND t.is_hidden=1"
+                elif state == "deleted": where = "WHERE t.deleted=1"
+                elif state == "active": where = "WHERE t.deleted=0 AND t.is_hidden=0"
+                if term:
+                    where += (" AND " if where else "WHERE ") + "(t.title LIKE ? OR u.display_name LIKE ? OR u.username LIKE ?)"
+                    params.extend([f"%{term}%"]*3)
+                params.append(100)
+                rows = db.execute("""SELECT t.id,t.title,t.body,t.created_at,t.deleted,t.is_hidden,t.hidden_until,t.hidden_reason,
+                    u.id AS user_id,u.username,u.display_name,
+                    (SELECT COUNT(*) FROM reports r WHERE r.target_type='topic' AND r.target_id=t.id) AS reports
+                    FROM topics t JOIN users u ON u.id=t.user_id """+where+" ORDER BY t.created_at DESC LIMIT ?", params).fetchall()
+                return self.send_json(200, {"topics": [dict(row) for row in rows]})
+            if path.startswith("/api/admin/backups/download/"):
+                user = self.require_user(db)
+                if not user or not self.require_admin(user): return
+                name = path.rsplit("/", 1)[-1]
+                if not re.fullmatch(r"masaha-[0-9]{8}-[0-9]{6}\.(?:sqlite3|dump)", name):
+                    return self.send_json(400, {"error": "Invalid backup name"})
+                target = BACKUP_DIR / name
+                if not target.is_file(): return self.send_json(404, {"error": "Backup not found"})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(target.stat().st_size))
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.end_headers()
+                with target.open("rb") as backup_file: shutil.copyfileobj(backup_file, self.wfile)
+                return
+            if path == "/api/admin/backups":
+                user = self.require_user(db)
+                if not user or not self.require_admin(user): return
+                files = sorted(BACKUP_DIR.glob("masaha-*") if BACKUP_DIR.exists() else [], key=lambda item:item.stat().st_mtime, reverse=True)
+                with BACKUP_STATE_LOCK: state = dict(BACKUP_STATE)
+                return self.send_json(200, {"configured": bool(BACKUP_BUCKET) if USE_POSTGRES else True,
+                    "offsite": bool(BACKUP_BUCKET), "status": state,
+                    "backups": [{"name": item.name,"size": item.stat().st_size,"createdAt": int(item.stat().st_mtime)} for item in files[:BACKUP_KEEP] if item.is_file()]})
             if path == "/api/topics":
                 query = parse_qs(parsed.query)
                 search = query.get("q", [""])[0].strip()[:100]
                 category = query.get("category", [""])[0]
+                tag = query.get("tag", [""])[0].strip().lstrip("#")[:24]
+                try: since = max(0, int(query.get("since", ["0"])[0]))
+                except ValueError: since = 0
                 sort = query.get("sort", ["newest"])[0]
                 try:
                     limit = max(1, min(50, int(query.get("limit", ["20"])[0])))
@@ -704,7 +842,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                          (SELECT COUNT(*) FROM likes l WHERE l.topic_id=t.id) AS like_count,
                          EXISTS(SELECT 1 FROM likes l WHERE l.topic_id=t.id AND l.user_id=?) AS liked_by_me,
                          EXISTS(SELECT 1 FROM bookmarks b WHERE b.topic_id=t.id AND b.user_id=?) AS bookmarked_by_me
-                         FROM topics t JOIN users u ON u.id=t.user_id WHERE t.deleted=0"""
+                         FROM topics t JOIN users u ON u.id=t.user_id WHERE t.deleted=0 AND is_hidden=0"""
                 filters = ""
                 filter_values = []
                 if search:
@@ -713,12 +851,16 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     filter_values.extend([needle, needle, needle, needle])
                 if category and db.execute("SELECT 1 FROM categories WHERE slug=?", (category,)).fetchone():
                     filters += " AND t.category=?"; filter_values.append(category)
+                if tag:
+                    filters += " AND t.tags LIKE ?"; filter_values.append("%\"" + tag.replace("%", "\\%").replace("_", "\\_") + "\"%")
+                if since:
+                    filters += " AND t.created_at>=?"; filter_values.append(since)
                 order = " ORDER BY t.is_pinned DESC,t.created_at DESC"
                 if sort == "popular":
                     order = " ORDER BY t.is_pinned DESC,like_count DESC,t.created_at DESC"
                 elif sort == "oldest":
                     order = " ORDER BY t.is_pinned DESC,t.created_at ASC"
-                total = db.execute("SELECT COUNT(*) FROM topics t JOIN users u ON u.id=t.user_id WHERE t.deleted=0" + filters, filter_values).fetchone()[0]
+                total = db.execute("SELECT COUNT(*) FROM topics t JOIN users u ON u.id=t.user_id WHERE t.deleted=0 AND is_hidden=0" + filters, filter_values).fetchone()[0]
                 sql = select_sql + filters + order + " LIMIT ? OFFSET ?"
                 values = [viewer["id"] if viewer else -1, viewer["id"] if viewer else -1, *filter_values, limit, offset]
                 rows = db.execute(sql, values).fetchall()
@@ -732,10 +874,15 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     (SELECT COUNT(*) FROM likes l WHERE l.topic_id=t.id) AS like_count,
                     EXISTS(SELECT 1 FROM likes l WHERE l.topic_id=t.id AND l.user_id=?) AS liked_by_me,
                     EXISTS(SELECT 1 FROM bookmarks b WHERE b.topic_id=t.id AND b.user_id=?) AS bookmarked_by_me
-                    FROM topics t JOIN users u ON u.id=t.user_id WHERE t.id=? AND t.deleted=0""", (viewer["id"] if viewer else -1, viewer["id"] if viewer else -1, topic_id)).fetchone()
+                    FROM topics t JOIN users u ON u.id=t.user_id WHERE t.id=? AND t.deleted=0 AND is_hidden=0""", (viewer["id"] if viewer else -1, viewer["id"] if viewer else -1, topic_id)).fetchone()
                 if not topic: return self.send_json(404, {"error": "Topic not found"})
-                comments = db.execute("""SELECT c.*,u.username,u.display_name FROM comments c
-                    JOIN users u ON u.id=c.user_id WHERE c.topic_id=? ORDER BY c.created_at""", (topic_id,)).fetchall()
+                comment_sort = parse_qs(parsed.query).get("comments", ["newest"])[0]
+                if comment_sort == "helpful":
+                    comment_order = "c.is_pinned DESC,CASE WHEN c.id=(SELECT best_answer_id FROM topics WHERE id=?) THEN 1 ELSE 0 END DESC,c.created_at DESC"
+                    comments = db.execute("SELECT c.*,u.username,u.display_name FROM comments c JOIN users u ON u.id=c.user_id WHERE c.topic_id=? ORDER BY " + comment_order, (topic_id, topic_id)).fetchall()
+                else:
+                    comment_order = "c.is_pinned DESC,c.created_at ASC" if comment_sort == "oldest" else "c.is_pinned DESC,c.created_at DESC"
+                    comments = db.execute("SELECT c.*,u.username,u.display_name FROM comments c JOIN users u ON u.id=c.user_id WHERE c.topic_id=? ORDER BY " + comment_order, (topic_id,)).fetchall()
                 return self.send_json(200, {"topic": self.topic_json(topic), "comments": [self.comment_json(x) for x in comments],
                                             "poll": poll_details(db, topic_id, viewer["id"] if viewer else None)})
             if path == "/api/members":
@@ -760,15 +907,18 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 except ValueError: return self.send_json(400, {"error": "Invalid user id"})
                 user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
                 if not user: return self.send_json(404, {"error": "Profile not found"})
+                viewer = self.session_user(db)
+                if user["profile_visibility"] == "private" and not (viewer and (viewer["id"] == user_id or viewer["role"] in ("admin", "moderator"))):
+                    return self.send_json(403, {"error": "PROFILE_PRIVATE"})
                 posts = db.execute("""SELECT t.*,u.username,u.display_name,u.avatar_url AS author_avatar,
                     (SELECT COUNT(*) FROM comments c WHERE c.topic_id=t.id) AS comment_count,
                     (SELECT COUNT(*) FROM likes l WHERE l.topic_id=t.id) AS like_count,
                     0 AS liked_by_me, 0 AS bookmarked_by_me
-                    FROM topics t JOIN users u ON u.id=t.user_id WHERE t.user_id=? AND t.deleted=0
+                    FROM topics t JOIN users u ON u.id=t.user_id WHERE t.user_id=? AND t.deleted=0 AND is_hidden=0
                     ORDER BY t.created_at DESC LIMIT 50""", (user_id,)).fetchall()
                 replies = db.execute("""SELECT c.id,c.body,c.created_at,t.id AS topic_id,t.title
                     FROM comments c JOIN topics t ON t.id=c.topic_id
-                    WHERE c.user_id=? AND t.deleted=0 ORDER BY c.created_at DESC LIMIT 50""", (user_id,)).fetchall()
+                    WHERE c.user_id=? AND t.deleted=0 AND is_hidden=0 ORDER BY c.created_at DESC LIMIT 50""", (user_id,)).fetchall()
                 profile = public_user(user)
                 profile.update(member_metrics(db, user_id))
                 profile["followerCount"] = db.execute("SELECT COUNT(*) FROM user_follows WHERE followed_id=?", (user_id,)).fetchone()[0]
@@ -779,10 +929,11 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     "replies": [dict(row) for row in replies]})
             if path == "/api/admin/reports":
                 user = self.require_user(db)
-                if not user or not self.require_admin(user): return
+                if not user or not self.require_staff(user): return
                 status = parse_qs(parsed.query).get("status", ["open"])[0]
                 if status not in ("open", "resolved"): status = "open"
                 rows = db.execute("""SELECT r.*,u.username AS reporter,u.display_name AS reporter_name,
+                    (SELECT COUNT(*) FROM reports rr WHERE rr.target_type=r.target_type AND rr.target_id=r.target_id) AS target_report_count,
                     CASE WHEN r.target_type='topic' THEN (SELECT title FROM topics WHERE id=r.target_id)
                     ELSE (SELECT t.title FROM comments c JOIN topics t ON t.id=c.topic_id WHERE c.id=r.target_id) END AS topic_title
                     ,CASE WHEN r.target_type='topic' THEN r.target_id
@@ -803,13 +954,14 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 "bestAnswerId": row["best_answer_id"] if "best_answer_id" in row.keys() else None,
                 "hasPoll": bool(row["poll_json"]) if "poll_json" in row.keys() else False,
                 "imageUrl": row["image_url"] if "image_url" in row.keys() else "",
+                "images": (json.loads(row["image_urls"] or "[]") or ([row["image_url"]] if row["image_url"] else [])) if "image_urls" in row.keys() else ([row["image_url"]] if row["image_url"] else []),
                 "tags": json.loads(row["tags"] or "[]") if "tags" in row.keys() else [],
                 "user": {"id": row["user_id"], "username": row["username"],
                 "displayName": row["display_name"], "avatarUrl": row["author_avatar"] if "author_avatar" in row.keys() else ""}}
 
     @staticmethod
     def comment_json(row):
-        return {"id": row["id"], "body": row["body"], "createdAt": row["created_at"],
+        return {"id": row["id"], "body": row["body"], "createdAt": row["created_at"], "isPinned": bool(row["is_pinned"]) if "is_pinned" in row.keys() else False,
                 "user": {"id": row["user_id"], "username": row["username"],
                          "displayName": row["display_name"]}}
 
@@ -907,6 +1059,13 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         db.execute("INSERT INTO login_attempts(ip_hash,failures,window_start,blocked_until) VALUES(?,?,?,?) ON CONFLICT(ip_hash) DO UPDATE SET failures=excluded.failures,window_start=excluded.window_start,blocked_until=excluded.blocked_until", (ip_hash,failures,window_start,blocked_until))
                         return self.send_json(401, {"error": "Email or password is incorrect"})
                     db.execute("DELETE FROM login_attempts WHERE ip_hash=?", (ip_hash,))
+                    if user["is_banned"]:
+                        until = user["ban_until"] if "ban_until" in user.keys() else None
+                        if until and until <= current_time:
+                            db.execute("UPDATE users SET is_banned=0,ban_until=NULL WHERE id=?", (user["id"],))
+                            user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+                        else:
+                            return self.send_json(403, {"error": "ACCOUNT_SUSPENDED", "banUntil": until})
                     if ADMIN_EMAIL and user["email"].lower() == ADMIN_EMAIL and user["role"] != "admin":
                         db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
                         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -983,7 +1142,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path.startswith("/api/topics/") and path.endswith("/best-answer"):
                     try: topic_id=int(path.split("/")[3]); comment_id=int(data.get("commentId"))
                     except (ValueError,TypeError,IndexError): return self.send_json(400,{"error":"Invalid answer"})
-                    topic=db.execute("SELECT user_id,best_answer_id FROM topics WHERE id=? AND deleted=0",(topic_id,)).fetchone()
+                    topic=db.execute("SELECT user_id,best_answer_id FROM topics WHERE id=? AND deleted=0 AND is_hidden=0",(topic_id,)).fetchone()
                     comment=db.execute("SELECT id FROM comments WHERE id=? AND topic_id=?",(comment_id,topic_id)).fetchone()
                     if not topic or not comment: return self.send_json(404,{"error":"Answer not found"})
                     if user["role"]!="admin" and topic["user_id"]!=user["id"]: return self.send_json(403,{"error":"Only the topic author can select the best answer"})
@@ -1015,17 +1174,17 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path.startswith("/api/topics/") and path.endswith("/vote"):
                     try: topic_id = int(path.split("/")[3]); option_index = int(data.get("optionIndex"))
                     except (ValueError, TypeError, IndexError): return self.send_json(400, {"error": "Invalid vote"})
-                    topic = db.execute("SELECT poll_json FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    topic = db.execute("SELECT poll_json FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone()
                     if not topic or not topic["poll_json"]: return self.send_json(404, {"error": "Poll not found"})
                     poll = json.loads(topic["poll_json"])
                     if option_index < 0 or option_index >= len(poll["options"]): return self.send_json(400, {"error": "Invalid option"})
                     db.execute("INSERT INTO poll_votes(user_id,topic_id,option_index,created_at) VALUES(?,?,?,?) ON CONFLICT(user_id,topic_id) DO UPDATE SET option_index=excluded.option_index,created_at=excluded.created_at", (user["id"], topic_id, option_index, now()))
                     return self.send_json(200, {"poll": poll_details(db, topic_id, user["id"])})
                 if path.startswith("/api/admin/topics/") and path.endswith("/pin"):
-                    if not self.require_admin(user): return
+                    if not self.require_staff(user): return
                     try: topic_id = int(path.split("/")[4])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
-                    topic = db.execute("SELECT is_pinned FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    topic = db.execute("SELECT is_pinned FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
                     pinned = not bool(topic["is_pinned"])
                     db.execute("UPDATE topics SET is_pinned=? WHERE id=?", (int(pinned), topic_id))
@@ -1034,7 +1193,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path.startswith("/api/topics/") and path.endswith("/like"):
                     try: topic_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
-                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
                     existing = db.execute("SELECT 1 FROM likes WHERE user_id=? AND topic_id=?", (user["id"], topic_id)).fetchone()
                     if existing:
@@ -1043,29 +1202,93 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     else:
                         db.execute("INSERT INTO likes(user_id,topic_id,created_at) VALUES(?,?,?)", (user["id"], topic_id, now()))
                         liked = True
-                        if topic["user_id"] != user["id"]:
+                        if topic["user_id"] != user["id"] and notification_enabled(db, topic["user_id"], "like"):
                             db.execute("INSERT INTO notifications(user_id,actor_id,topic_id,kind,created_at) VALUES(?,?,?,?,?)", (topic["user_id"], user["id"], topic_id, "like", now()))
                     return self.send_json(200, {"liked": liked})
                 if path.startswith("/api/topics/") and path.endswith("/bookmark"):
                     try: topic_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
-                    if not db.execute("SELECT 1 FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone(): return self.send_json(404, {"error": "Topic not found"})
+                    if not db.execute("SELECT 1 FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone(): return self.send_json(404, {"error": "Topic not found"})
                     existing = db.execute("SELECT 1 FROM bookmarks WHERE user_id=? AND topic_id=?", (user["id"], topic_id)).fetchone()
                     if existing: db.execute("DELETE FROM bookmarks WHERE user_id=? AND topic_id=?", (user["id"], topic_id))
                     else: db.execute("INSERT INTO bookmarks(user_id,topic_id,created_at) VALUES(?,?,?)", (user["id"], topic_id, now()))
                     return self.send_json(200, {"saved": not bool(existing)})
                 if path.startswith("/api/admin/users/") and path.endswith("/ban"):
-                    if not self.require_admin(user): return
+                    if not self.require_staff(user): return
                     try: target_id = int(path.split("/")[4])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid user id"})
                     target = db.execute("SELECT role,is_banned FROM users WHERE id=?", (target_id,)).fetchone()
                     if not target: return self.send_json(404, {"error": "Member not found"})
                     if target["role"] == "admin" or target_id == user["id"]: return self.send_json(400, {"error": "This account cannot be suspended"})
-                    db.execute("UPDATE users SET is_banned=1-is_banned WHERE id=?", (target_id,))
-                    if not target["is_banned"]:
+                    if target["is_banned"]:
+                        db.execute("UPDATE users SET is_banned=0,ban_until=NULL WHERE id=?", (target_id,))
+                        action, details = "unban_user", "Suspension lifted"
+                    else:
+                        try: duration = max(0, min(2592000, int(data.get("durationSeconds", 0))))
+                        except (TypeError, ValueError): return self.send_json(400, {"error": "Invalid suspension duration"})
+                        until = now()+duration if duration else None
+                        db.execute("UPDATE users SET is_banned=1,ban_until=? WHERE id=?", (until, target_id))
                         db.execute("DELETE FROM sessions WHERE user_id=?", (target_id,))
-                    db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"toggle_ban","user",target_id,"Account suspension status changed",now()))
-                    return self.send_json(200, {"ok": True})
+                        action = "ban_user"
+                        details = f"Suspended until {until}" if until else "Suspended permanently"
+                    db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],action,"user",target_id,details,now()))
+                    return self.send_json(200, {"ok": True, "banUntil": until if not target["is_banned"] else None})
+                if path == "/api/admin/backups/create":
+                    if not self.require_admin(user): return
+                    with BACKUP_STATE_LOCK: BACKUP_STATE.update(status="running", updatedAt=now(), error="")
+                    try:
+                        target = backup_database()
+                        with BACKUP_STATE_LOCK: BACKUP_STATE.update(status="success", updatedAt=int(target.stat().st_mtime), error="")
+                        db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"backup_created","system",0,target.name,now()))
+                        return self.send_json(200, {"ok": True, "name": target.name, "size": target.stat().st_size})
+                    except Exception as exc:
+                        with BACKUP_STATE_LOCK: BACKUP_STATE.update(status="error", updatedAt=now(), error=str(exc)[:300])
+                        db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"backup_failed","system",0,str(exc)[:240],now()))
+                        return self.send_json(500, {"error": "BACKUP_FAILED", "details": str(exc)[:300]})
+                if path.startswith("/api/admin/users/") and path.endswith("/notes"):
+                    if not self.require_staff(user): return
+                    try: target_id = int(path.split("/")[4])
+                    except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid user id"})
+                    note = str(data.get("note", "")).strip()
+                    if not note or len(note)>1000: return self.send_json(400, {"error": "Note must be 1–1000 characters"})
+                    if not db.execute("SELECT 1 FROM users WHERE id=?", (target_id,)).fetchone(): return self.send_json(404, {"error": "Member not found"})
+                    db.execute("INSERT INTO member_notes(user_id,admin_id,note,created_at) VALUES(?,?,?,?)",(target_id,user["id"],note,now()))
+                    db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"member_note","user",target_id,note[:240],now()))
+                    return self.send_json(201, {"ok": True})
+                if path.startswith("/api/admin/users/") and path.endswith("/role"):
+                    if not self.require_admin(user): return
+                    try: target_id = int(path.split("/")[4])
+                    except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid user id"})
+                    role = data.get("role")
+                    target = db.execute("SELECT role FROM users WHERE id=?", (target_id,)).fetchone()
+                    if not target: return self.send_json(404, {"error": "Member not found"})
+                    if target["role"] == "admin" or target_id == user["id"] or role not in ("member", "moderator"):
+                        return self.send_json(400, {"error": "Invalid role change"})
+                    db.execute("UPDATE users SET role=? WHERE id=?", (role,target_id))
+                    db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"role_change","user",target_id,f"Role changed to {role}",now()))
+                    return self.send_json(200, {"ok": True, "role": role})
+                if path.startswith("/api/admin/topics/") and path.endswith("/hide"):
+                    if not self.require_staff(user): return
+                    try: topic_id = int(path.split("/")[4])
+                    except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
+                    topic = db.execute("SELECT id,deleted FROM topics WHERE id=?", (topic_id,)).fetchone()
+                    if not topic or topic["deleted"]: return self.send_json(404, {"error": "Topic not found"})
+                    try: duration = max(0,min(2592000,int(data.get("durationSeconds",0))))
+                    except (TypeError,ValueError): return self.send_json(400,{"error":"Invalid hide duration"})
+                    until=now()+duration if duration else None
+                    reason=str(data.get("reason","Review requested")).strip()[:240]
+                    db.execute("UPDATE topics SET is_hidden=1,hidden_until=?,hidden_reason=? WHERE id=?",(until,reason,topic_id))
+                    db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"hide_topic","topic",topic_id,reason,now()))
+                    return self.send_json(200,{"ok":True,"hiddenUntil":until})
+                if path.startswith("/api/admin/topics/") and path.endswith("/restore"):
+                    if not self.require_staff(user): return
+                    try: topic_id = int(path.split("/")[4])
+                    except (ValueError, IndexError): return self.send_json(400,{"error":"Invalid topic id"})
+                    topic=db.execute("SELECT id,deleted,is_hidden FROM topics WHERE id=?",(topic_id,)).fetchone()
+                    if not topic:return self.send_json(404,{"error":"Topic not found"})
+                    db.execute("UPDATE topics SET deleted=0,is_hidden=0,hidden_until=NULL,hidden_reason='' WHERE id=?",(topic_id,))
+                    db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"restore_topic","topic",topic_id,"Topic restored or made visible",now()))
+                    return self.send_json(200,{"ok":True})
                 if path == "/api/me/avatar":
                     image = str(data.get("image", ""))
                     if len(image) > 2_800_000 or not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}", image):
@@ -1078,6 +1301,11 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         return self.send_json(400, {"error": "Image must be PNG, JPEG, or WebP and under 2 MB"})
                     db.execute("UPDATE users SET cover_url=? WHERE id=?", (image, user["id"]))
                     return self.send_json(200, {"coverUrl": image})
+                if path == "/api/me/notification-preferences":
+                    prefs = data.get("preferences", {})
+                    normalized = {key: bool(prefs.get(key, True)) for key in ("replies", "likes", "follows")}
+                    db.execute("UPDATE users SET notification_preferences=? WHERE id=?", (json.dumps(normalized), user["id"]))
+                    return self.send_json(200, {"preferences": normalized})
                 if path == "/api/me/settings":
                     current_password = str(data.get("currentPassword", ""))
                     try:
@@ -1119,9 +1347,13 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     tags = normalize_tags(data.get("tags", []))
                     if not title or len(title) > 120 or not body or len(body) > 5000 or not db.execute("SELECT 1 FROM categories WHERE slug=?", (category,)).fetchone():
                         return self.send_json(400, {"error": "Check the title, message, and category"})
-                    image = str(data.get("image", ""))
-                    if image and (len(image) > 2_800_000 or not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}", image)):
-                        return self.send_json(400, {"error": "Image must be PNG, JPEG, or WebP and under 2 MB"})
+                    images = data.get("images", [])
+                    if not isinstance(images, list): images = [images]
+                    if not images and data.get("image"): images = [data.get("image")]
+                    images = [str(value) for value in images[:4]]
+                    if sum(len(value) for value in images) > 11_200_000 or any(len(value)>2_800_000 or not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}", value) for value in images):
+                        return self.send_json(400, {"error": "Use up to four PNG, JPEG, or WebP images, each under 2 MB"})
+                    image = images[0] if images else ""
                     poll_question = str(data.get("pollQuestion", "")).strip()[:160]
                     raw_options = data.get("pollOptions", [])
                     if isinstance(raw_options, str): raw_options = raw_options.splitlines()
@@ -1131,18 +1363,18 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if poll_options and (not poll_question or len(poll_options) < 2):
                         return self.send_json(400, {"error": "POLL_NEEDS_QUESTION"})
                     poll_json = json.dumps({"question": poll_question, "options": poll_options}, ensure_ascii=False) if poll_options else ""
-                    duplicate = db.execute("SELECT 1 FROM topics WHERE user_id=? AND deleted=0 AND lower(title)=lower(?) AND lower(body)=lower(?) AND created_at>? LIMIT 1", (user["id"], title, body, now()-86400)).fetchone()
+                    duplicate = db.execute("SELECT 1 FROM topics WHERE user_id=? AND deleted=0 AND is_hidden=0 AND lower(title)=lower(?) AND lower(body)=lower(?) AND created_at>? LIMIT 1", (user["id"], title, body, now()-86400)).fetchone()
                     if duplicate:
                         return self.send_json(409, {"error": "DUPLICATE_TOPIC"})
                     retry = consume_rate_limit(db, user["id"], "topic", 5, 3600)
                     if retry:
                         return self.send_json(429, {"error": "RATE_LIMITED", "retryAfter": retry})
-                    cur = db.execute("INSERT INTO topics(user_id,title,body,category,created_at,image_url,tags,poll_json) VALUES(?,?,?,?,?,?,?,?)",
-                                     (user["id"], title, body, category, now(), image, json.dumps(tags, ensure_ascii=False), poll_json))
+                    cur = db.execute("INSERT INTO topics(user_id,title,body,category,created_at,image_url,image_urls,tags,poll_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                                     (user["id"], title, body, category, now(), image, json.dumps(images, ensure_ascii=False), json.dumps(tags, ensure_ascii=False), poll_json))
                     recipients = {row[0] for row in db.execute("SELECT follower_id FROM user_follows WHERE followed_id=?", (user["id"],)).fetchall()}
                     recipients.update(row[0] for row in db.execute("SELECT user_id FROM category_follows WHERE category_slug=?", (category,)).fetchall())
                     for recipient in recipients:
-                        if recipient != user["id"]:
+                        if recipient != user["id"] and notification_enabled(db, recipient, "followed_topic"):
                             db.execute("INSERT INTO notifications(user_id,actor_id,topic_id,kind,created_at) VALUES(?,?,?,?,?)", (recipient, user["id"], cur.lastrowid, "followed_topic", now()))
                     return self.send_json(201, {"id": cur.lastrowid})
                 if path == "/api/admin/categories":
@@ -1169,11 +1401,22 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     db.execute("DELETE FROM category_follows WHERE category_slug=?", (slug,))
                     deleted = db.execute("DELETE FROM categories WHERE slug=?", (slug,))
                     return self.send_json(200 if deleted.rowcount else 404, {"ok": bool(deleted.rowcount)})
+                if path.startswith("/api/topics/") and len(path.split("/")) == 7 and path.endswith("/pin-comment"):
+                    try: topic_id, comment_id = int(path.split("/")[3]), int(path.split("/")[5])
+                    except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid reply"})
+                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone()
+                    comment = db.execute("SELECT id,is_pinned FROM comments WHERE id=? AND topic_id=?", (comment_id, topic_id)).fetchone()
+                    if not topic or not comment: return self.send_json(404, {"error": "Reply not found"})
+                    if user["role"] != "admin" and topic["user_id"] != user["id"]: return self.send_json(403, {"error": "Only the discussion author or an admin can pin a reply"})
+                    pinned = not bool(comment["is_pinned"])
+                    db.execute("UPDATE comments SET is_pinned=0 WHERE topic_id=?", (topic_id,))
+                    if pinned: db.execute("UPDATE comments SET is_pinned=1 WHERE id=?", (comment_id,))
+                    return self.send_json(200, {"ok": True, "pinned": pinned})
                 if path.startswith("/api/topics/") and path.endswith("/comments"):
                     try: topic_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid topic id"})
                     body = str(data.get("body", "")).strip()
-                    topic = db.execute("SELECT id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    topic = db.execute("SELECT id FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
                     if not body or len(body) > 3000: return self.send_json(400, {"error": "Comment must be 1–3000 characters"})
                     retry = consume_rate_limit(db, user["id"], "comment", 20, 3600)
@@ -1186,7 +1429,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     recipients.update(row[0] for row in db.execute("SELECT DISTINCT user_id FROM comments WHERE topic_id=? AND user_id<>?", (topic_id, user["id"])).fetchall())
                     recipients.discard(user["id"])
                     for recipient in recipients:
-                        db.execute("INSERT INTO notifications(user_id,actor_id,topic_id,kind,created_at) VALUES(?,?,?,?,?)", (recipient, user["id"], topic_id, "reply_comment" if recipient != owner else "reply", now()))
+                        kind = "reply_comment" if recipient != owner else "reply"
+                        if notification_enabled(db, recipient, kind):
+                            db.execute("INSERT INTO notifications(user_id,actor_id,topic_id,kind,created_at) VALUES(?,?,?,?,?)", (recipient, user["id"], topic_id, kind, now()))
                     return self.send_json(201, {"id": cur.lastrowid})
                 if path == "/api/reports":
                     kind = data.get("targetType")
@@ -1198,7 +1443,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     retry = consume_rate_limit(db, user["id"], "report", 10, 3600)
                     if retry:
                         return self.send_json(429, {"error": "RATE_LIMITED", "retryAfter": retry})
-                    exists = db.execute("SELECT id FROM topics WHERE id=? AND deleted=0", (target_id,)).fetchone() if kind == "topic" else db.execute("SELECT id FROM comments WHERE id=?", (target_id,)).fetchone()
+                    exists = db.execute("SELECT id FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (target_id,)).fetchone() if kind == "topic" else db.execute("SELECT id FROM comments WHERE id=?", (target_id,)).fetchone()
                     if not exists: return self.send_json(404, {"error": "Content not found"})
                     db.execute("INSERT INTO reports(reporter_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?)",
                                (user["id"], kind, target_id, reason, now()))
@@ -1221,28 +1466,42 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     # or an old moderation report pointing at an already removed topic).
                     topic = db.execute("SELECT user_id,deleted FROM topics WHERE id=?", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
-                    if user["role"] != "admin" and topic["user_id"] != user["id"]:
+                    if user["role"] not in ("admin", "moderator") and topic["user_id"] != user["id"]:
                         return self.send_json(403, {"error": "Only the author or an admin can remove this topic"})
                     if topic["deleted"]:
                         return self.send_json(200, {"ok": True, "alreadyDeleted": True})
                     db.execute("UPDATE topics SET deleted=1 WHERE id=?", (topic_id,))
                     db.execute("UPDATE reports SET status='resolved' WHERE target_type='topic' AND target_id=?", (topic_id,))
-                    if user["role"]=="admin": db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"delete","topic",topic_id,"Topic removed",now()))
+                    if user["role"] in ("admin", "moderator"): db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"delete","topic",topic_id,"Topic removed",now()))
                     return self.send_json(200, {"ok": True})
                 if path.startswith("/api/comments/") and path.endswith("/delete"):
                     try: comment_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid comment id"})
                     comment = db.execute("SELECT user_id FROM comments WHERE id=?", (comment_id,)).fetchone()
                     if not comment: return self.send_json(404, {"error": "Comment not found"})
-                    if user["role"] != "admin" and comment["user_id"] != user["id"]:
+                    if user["role"] not in ("admin", "moderator") and comment["user_id"] != user["id"]:
                         return self.send_json(403, {"error": "Only the author or an admin can remove this reply"})
                     db.execute("DELETE FROM comments WHERE id=?", (comment_id,))
                     db.execute("UPDATE topics SET best_answer_id=NULL WHERE best_answer_id=?", (comment_id,))
                     db.execute("UPDATE reports SET status='resolved' WHERE target_type='comment' AND target_id=?", (comment_id,))
-                    if user["role"]=="admin": db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"delete","comment",comment_id,"Reply removed",now()))
+                    if user["role"] in ("admin", "moderator"): db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"delete","comment",comment_id,"Reply removed",now()))
                     return self.send_json(200, {"ok": True})
+                if path == "/api/admin/reports/resolve-batch":
+                    if not self.require_staff(user): return
+                    ids = data.get("ids", [])
+                    if not isinstance(ids, list) or not ids or len(ids) > 100:
+                        return self.send_json(400, {"error": "Select between 1 and 100 reports"})
+                    try: ids = list(dict.fromkeys(int(value) for value in ids))
+                    except (TypeError, ValueError): return self.send_json(400, {"error": "Invalid report ids"})
+                    resolved = 0
+                    for report_id in ids:
+                        changed = db.execute("UPDATE reports SET status='resolved' WHERE id=? AND status='open'", (report_id,)).rowcount
+                        if changed:
+                            resolved += 1
+                            db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"resolve_report","report",report_id,"Resolved in bulk review",now()))
+                    return self.send_json(200, {"resolved": resolved})
                 if path.startswith("/api/reports/") and path.endswith("/resolve"):
-                    if not self.require_admin(user): return
+                    if not self.require_staff(user): return
                     try: report_id = int(path.split("/")[3])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid report id"})
                     db.execute("UPDATE reports SET status='resolved' WHERE id=?", (report_id,))
@@ -1286,7 +1545,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     user = self.require_user(db)
                     if not user: return
                     admin_route = path.startswith("/api/admin/")
-                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0", (topic_id,)).fetchone()
+                    topic = db.execute("SELECT user_id FROM topics WHERE id=? AND deleted=0 AND is_hidden=0", (topic_id,)).fetchone()
                     if not topic: return self.send_json(404, {"error": "Topic not found"})
                     if admin_route and not self.require_admin(user): return
                     if not admin_route and user["role"] != "admin" and topic["user_id"] != user["id"]:
@@ -1297,7 +1556,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     tags = normalize_tags(data.get("tags", []))
                     if not title or len(title) > 120 or not body or len(body) > 5000 or not db.execute("SELECT 1 FROM categories WHERE slug=?", (category,)).fetchone():
                         return self.send_json(400, {"error": "Check the title, message, and category"})
-                    cur = db.execute("UPDATE topics SET title=?,body=?,category=?,tags=? WHERE id=? AND deleted=0", (title, body, category, json.dumps(tags, ensure_ascii=False), topic_id))
+                    cur = db.execute("UPDATE topics SET title=?,body=?,category=?,tags=? WHERE id=? AND deleted=0 AND is_hidden=0", (title, body, category, json.dumps(tags, ensure_ascii=False), topic_id))
                     if not cur.rowcount: return self.send_json(404, {"error": "Topic not found"})
                     return self.send_json(200, {"ok": True})
             except ValueError as exc:
@@ -1314,9 +1573,13 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if not user: return
                 display_name = str(data.get("displayName", user["display_name"])).strip()[:50]
                 bio = str(data.get("bio", "")).strip()[:500]
+                website = str(data.get("website", "")).strip()[:240]
+                if website and (not website.startswith(("https://", "http://")) or any(ch in website for ch in "\r\n<>")): return self.send_json(400, {"error": "Enter a valid website URL"})
+                interests = normalize_tags(data.get("interests", []))
+                visibility = data.get("profileVisibility", "public") if data.get("profileVisibility", "public") in ("public", "private") else "public"
                 if len(display_name) < 2:
                     return self.send_json(400, {"error": "Display name must have at least 2 characters"})
-                db.execute("UPDATE users SET display_name=?,bio=? WHERE id=?", (display_name,bio,user["id"]))
+                db.execute("UPDATE users SET display_name=?,bio=?,website=?,interests=?,profile_visibility=? WHERE id=?", (display_name,bio,website,json.dumps(interests, ensure_ascii=False),visibility,user["id"]))
                 updated = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
                 return self.send_json(200, {"user": public_user(updated)})
         except ValueError as exc:
