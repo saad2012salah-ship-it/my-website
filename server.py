@@ -506,7 +506,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
             return None
         digest = hashlib.sha256(token.encode()).hexdigest()
         row = db.execute("""SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
-                          WHERE s.token_hash=? AND s.expires_at>? AND u.email_verified=1""", (digest, now())).fetchone()
+                          WHERE s.token_hash=? AND s.expires_at>?""", (digest, now())).fetchone()
         return row
 
     def require_user(self, db):
@@ -646,7 +646,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 user = self.require_user(db)
                 if not user or not self.require_admin(user): return
                 stats = {
-                    "members": db.execute("SELECT COUNT(*) FROM users WHERE email_verified=1").fetchone()[0],
+                    "members": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
                     "topics": db.execute("SELECT COUNT(*) FROM topics WHERE deleted=0").fetchone()[0],
                     "replies": db.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
                     "openReports": db.execute("SELECT COUNT(*) FROM reports WHERE status='open'").fetchone()[0],
@@ -814,16 +814,20 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     salt = secrets.token_bytes(16)
                     digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
                     encoded = "scrypt$" + salt.hex() + "$" + digest.hex()
+                    role = "admin" if ADMIN_EMAIL and email == ADMIN_EMAIL else "member"
                     try:
-                        cur = db.execute("INSERT INTO users(username,display_name,email,password_hash,role,created_at,email_verified) VALUES(?,?,?,?,?,?,0)",
-                                         (username, name, email, encoded, "member", now()))
+                        cur = db.execute("INSERT INTO users(username,display_name,email,password_hash,role,created_at,email_verified) VALUES(?,?,?,?,?,?,1)",
+                                         (username, name, email, encoded, role, now()))
                     except DB_INTEGRITY_ERROR:
                         if db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,)).fetchone():
                             return self.send_json(409, {"error": "USERNAME_TAKEN"})
                         return self.send_json(409, {"error": "That email is already registered"})
                     user = db.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
-                    _, email_sent = issue_verification_code(db, user)
-                    return self.send_json(201, {"verificationRequired": True, "emailSent": email_sent})
+                    token = secrets.token_urlsafe(32)
+                    db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)",
+                               (hashlib.sha256(token.encode()).hexdigest(), user["id"], now()+SESSION_SECONDS))
+                    response_user = public_user(user); response_user["email"] = user["email"]
+                    return self.send_json(201, {"user": response_user}, self.cookie_headers(token, SESSION_SECONDS))
                 if path == "/api/login":
                     email = str(data.get("email", "")).strip().lower()
                     password = str(data.get("password", ""))
@@ -838,9 +842,6 @@ class ForumHandler(SimpleHTTPRequestHandler):
                             pass
                     if not valid:
                         return self.send_json(401, {"error": "Email or password is incorrect"})
-                    if not user["email_verified"]:
-                        _, email_sent = issue_verification_code(db, user)
-                        return self.send_json(403, {"error": "EMAIL_NOT_VERIFIED", "emailSent": email_sent})
                     if ADMIN_EMAIL and email == ADMIN_EMAIL and user["role"] != "admin":
                         db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
                         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -1012,28 +1013,21 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if password and len(password) < 10:
                         return self.send_json(400, {"error": "Password must be at least 10 characters"})
                     if email != user["email"]:
-                        db.execute("UPDATE users SET email=?,email_verified=0 WHERE id=?", (email, user["id"]))
+                        db.execute("UPDATE users SET email=?,email_verified=1 WHERE id=?", (email, user["id"]))
                     if password:
                         salt = secrets.token_bytes(16)
                         encoded = "scrypt$" + salt.hex() + "$" + hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1).hex()
                         db.execute("UPDATE users SET password_hash=? WHERE id=?", (encoded, user["id"]))
                     raw_cookie = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-                    if email != user["email"]:
-                        db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
-                    elif "masaha_session" in raw_cookie:
+                    if "masaha_session" in raw_cookie:
                         current_hash = hashlib.sha256(raw_cookie["masaha_session"].value.encode()).hexdigest()
                         db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user["id"], current_hash))
                     if email != user["email"]:
                         db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
-                        updated = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-                        _, email_sent = issue_verification_code(db, updated)
-                    else:
-                        email_sent = True
                     updated = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
                     response_user = public_user(updated); response_user["email"] = updated["email"]
-                    response = {"ok": True, "verificationRequired": email != user["email"], "emailSent": email_sent, "user": response_user}
-                    headers = self.cookie_headers("", 0) if email != user["email"] else None
-                    return self.send_json(200, response, headers)
+                    response = {"ok": True, "user": response_user}
+                    return self.send_json(200, response)
                 if path == "/api/topics":
                     title = str(data.get("title", "")).strip()
                     body = str(data.get("body", "")).strip()
