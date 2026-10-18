@@ -42,6 +42,12 @@
 @media(max-width:760px){.admin-dashboard .admin-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.admin-dashboard .stat-tile:last-child{grid-column:1/-1}}
 @media(max-width:520px){.admin-hero{align-items:flex-start;flex-direction:column;border-radius:19px}.admin-hero .cta{width:100%;text-align:center}.admin-dashboard #admin-panel{padding:17px}.admin-dashboard #admin-categories,.admin-dashboard #members-list,.admin-dashboard .category-form{grid-template-columns:1fr}.admin-dashboard .category-form .cta{grid-column:auto}}
 :root[data-theme="dark"] .admin-dashboard #admin-panel{background:#171b2b;border-color:#353b54}:root[data-theme="dark"] .admin-dashboard .stat-tile{background:linear-gradient(145deg,#1d2035,#22223b);border-color:#383653}
+.admin-member-tools{margin-bottom:10px}.admin-member-tools input{width:100%;border:1px solid var(--line);border-radius:11px;padding:11px 13px;background:var(--paper);color:var(--ink)}
+.member-open{display:flex;align-items:center;flex-wrap:wrap;gap:7px;flex:1;min-width:0;border:0;background:transparent;color:var(--ink);text-align:start}.member-open span,.member-open i{color:var(--muted);font-size:12px;font-style:normal}.member-open:hover b{color:var(--green)}
+#member-pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding-top:14px;color:var(--muted);font-size:12px}#member-pagination button:disabled{opacity:.45;cursor:not-allowed}
+.member-detail-head{display:grid;gap:5px;padding:14px;border-radius:13px;background:var(--soft);color:var(--muted);font-size:13px}.member-detail-head b{font-size:20px;color:var(--ink)}
+.legal-page{margin:18px 0 28px}.legal-page .help-hero{border-radius:22px 22px 0 0}.legal-page .help-grid article{line-height:1.85}.footer-links{display:flex;justify-content:center;gap:16px;margin-top:9px}.footer-links a{color:var(--green);text-decoration:none;font-weight:650}.danger-button{margin-top:8px;border-color:#ffd7d4;color:#a33434}.full{width:100%}
+#report-count{display:inline-grid;place-items:center;min-width:19px;height:19px;margin-inline-start:4px;padding:0 5px;border-radius:999px;background:#e85c67;color:#fff;font-size:11px;line-height:1}
 
 /* Masaha visual refresh */
 :root{color-scheme:light;--ink:#20253b;--muted:#747b91;--line:#e8e9f1;--paper:#fff;--bg:#f6f7fc;--green:#5b4bd8;--soft:#efedff;--shadow:0 16px 44px rgba(38,42,82,.075);--mint:#19a889;--coral:#ff8b78}

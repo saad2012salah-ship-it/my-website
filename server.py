@@ -12,6 +12,7 @@ import smtplib
 import sqlite3
 import ssl
 import subprocess
+import sys
 import time
 import threading
 from contextlib import contextmanager
@@ -335,6 +336,10 @@ def init_db():
           id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           action TEXT NOT NULL, created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+          ip_hash TEXT PRIMARY KEY, failures INTEGER NOT NULL,
+          window_start INTEGER NOT NULL, blocked_until INTEGER NOT NULL DEFAULT 0
+        );
         CREATE INDEX IF NOT EXISTS topics_created ON topics(created_at DESC);
         CREATE INDEX IF NOT EXISTS comments_topic ON comments(topic_id, created_at);
         CREATE INDEX IF NOT EXISTS reports_status ON reports(status, created_at);
@@ -640,8 +645,35 @@ class ForumHandler(SimpleHTTPRequestHandler):
             if path == "/api/admin/users":
                 user = self.require_user(db)
                 if not user or not self.require_admin(user): return
-                rows = db.execute("SELECT id,username,display_name,role,is_banned FROM users ORDER BY created_at DESC LIMIT 200").fetchall()
-                return self.send_json(200, {"users": [dict(row) for row in rows]})
+                query = parse_qs(parsed.query)
+                term = query.get("q", [""])[0].strip()[:100]
+                try:
+                    limit = max(1, min(50, int(query.get("limit", ["20"])[0])))
+                    offset = max(0, int(query.get("offset", ["0"])[0]))
+                except ValueError:
+                    limit, offset = 20, 0
+                where = " WHERE (username LIKE ? OR display_name LIKE ? OR email LIKE ?)" if term else ""
+                params = ([f"%{term}%"] * 3) if term else []
+                total = db.execute("SELECT COUNT(*) FROM users" + where, params).fetchone()[0]
+                rows = db.execute("SELECT id,username,display_name,email,role,is_banned,created_at FROM users" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+                return self.send_json(200, {"users": [dict(row) for row in rows], "total": total})
+            if path.startswith("/api/admin/users/"):
+                user = self.require_user(db)
+                if not user or not self.require_admin(user): return
+                try: target_id = int(path.rsplit("/", 1)[1])
+                except ValueError: return self.send_json(400, {"error": "Invalid user id"})
+                target = db.execute("SELECT id,username,display_name,email,role,is_banned,bio,created_at FROM users WHERE id=?", (target_id,)).fetchone()
+                if not target: return self.send_json(404, {"error": "Member not found"})
+                topics = db.execute("SELECT id,title,created_at FROM topics WHERE user_id=? AND deleted=0 ORDER BY created_at DESC LIMIT 10", (target_id,)).fetchall()
+                replies = db.execute("SELECT c.id,c.body,c.created_at,t.id AS topic_id,t.title FROM comments c JOIN topics t ON t.id=c.topic_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT 10", (target_id,)).fetchall()
+                report_count = db.execute("SELECT COUNT(*) FROM reports r WHERE (r.target_type='topic' AND r.target_id IN (SELECT id FROM topics WHERE user_id=?)) OR (r.target_type='comment' AND r.target_id IN (SELECT id FROM comments WHERE user_id=?))", (target_id,target_id)).fetchone()[0]
+                reports = db.execute("""SELECT r.id,r.target_type,r.target_id,r.reason,r.status,r.created_at,
+                    CASE WHEN r.target_type='topic' THEN (SELECT title FROM topics WHERE id=r.target_id)
+                    ELSE (SELECT t.title FROM comments c JOIN topics t ON t.id=c.topic_id WHERE c.id=r.target_id) END AS topic_title
+                    FROM reports r WHERE (r.target_type='topic' AND r.target_id IN (SELECT id FROM topics WHERE user_id=?))
+                    OR (r.target_type='comment' AND r.target_id IN (SELECT id FROM comments WHERE user_id=?))
+                    ORDER BY r.created_at DESC LIMIT 20""", (target_id,target_id)).fetchall()
+                return self.send_json(200, {"user": dict(target), "topics": [dict(row) for row in topics], "replies": [dict(row) for row in replies], "reportsAgainst": report_count, "reports": [dict(row) for row in reports]})
             if path == "/api/admin/stats":
                 user = self.require_user(db)
                 if not user or not self.require_admin(user): return
@@ -831,7 +863,15 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path == "/api/login":
                     email = str(data.get("email", "")).strip().lower()
                     password = str(data.get("password", ""))
+                    ip = self.client_address[0] if self.client_address else "unknown"
                     user = db.execute("SELECT * FROM users WHERE lower(email)=? OR lower(username)=?", (email, email)).fetchone()
+                    identity = str(user["id"]) if user else email
+                    ip_hash = hashlib.sha256(f"{ip}:{identity}".encode()).hexdigest()
+                    current_time = now()
+                    db.execute("DELETE FROM login_attempts WHERE window_start<?", (current_time-86400,))
+                    attempt = db.execute("SELECT failures,window_start,blocked_until FROM login_attempts WHERE ip_hash=?", (ip_hash,)).fetchone()
+                    if attempt and attempt["blocked_until"] > current_time:
+                        return self.send_json(429, {"error": "LOGIN_RATE_LIMITED", "retryAfter": attempt["blocked_until"]-current_time})
                     valid = False
                     if user:
                         try:
@@ -841,7 +881,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         except (ValueError, TypeError):
                             pass
                     if not valid:
+                        failures = attempt["failures"] + 1 if attempt and current_time-attempt["window_start"] < 900 else 1
+                        window_start = attempt["window_start"] if attempt and current_time-attempt["window_start"] < 900 else current_time
+                        blocked_until = current_time + 900 if failures >= 8 else 0
+                        db.execute("INSERT INTO login_attempts(ip_hash,failures,window_start,blocked_until) VALUES(?,?,?,?) ON CONFLICT(ip_hash) DO UPDATE SET failures=excluded.failures,window_start=excluded.window_start,blocked_until=excluded.blocked_until", (ip_hash,failures,window_start,blocked_until))
                         return self.send_json(401, {"error": "Email or password is incorrect"})
+                    db.execute("DELETE FROM login_attempts WHERE ip_hash=?", (ip_hash,))
                     if ADMIN_EMAIL and user["email"].lower() == ADMIN_EMAIL and user["role"] != "admin":
                         db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
                         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -855,6 +900,11 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if user:
                         raw = cookies.SimpleCookie(self.headers.get("Cookie", ""))["masaha_session"].value
                         db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(raw.encode()).hexdigest(),))
+                    return self.send_json(200, {"ok": True}, self.cookie_headers("", 0))
+                if path == "/api/me/logout-all":
+                    user = self.require_user(db)
+                    if not user: return
+                    db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
                     return self.send_json(200, {"ok": True}, self.cookie_headers("", 0))
                 if path == "/api/forgot-password":
                     email = str(data.get("email", "")).strip().lower()
@@ -886,6 +936,18 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     return self.send_json(200, {"ok": True}, self.cookie_headers("", 0))
                 user = self.require_user(db)
                 if not user: return
+                if path == "/api/me/delete-account":
+                    password = str(data.get("password", ""))
+                    try:
+                        _, salt_hex, hash_hex = user["password_hash"].split("$")
+                        candidate = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1)
+                        valid = hmac.compare_digest(candidate.hex(), hash_hex)
+                    except (ValueError, TypeError):
+                        valid = False
+                    if not valid: return self.send_json(403, {"error": "CURRENT_PASSWORD_INVALID"})
+                    if user["role"] == "admin": return self.send_json(403, {"error": "Admin account cannot be self-deleted"})
+                    db.execute("DELETE FROM users WHERE id=?", (user["id"],))
+                    return self.send_json(200, {"ok": True}, self.cookie_headers("", 0))
                 if path == "/api/messages":
                     try: recipient_id = int(data.get("recipientId"))
                     except (TypeError, ValueError): return self.send_json(400, {"error": "Invalid member"})
@@ -976,10 +1038,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if not self.require_admin(user): return
                     try: target_id = int(path.split("/")[4])
                     except (ValueError, IndexError): return self.send_json(400, {"error": "Invalid user id"})
-                    target = db.execute("SELECT role FROM users WHERE id=?", (target_id,)).fetchone()
+                    target = db.execute("SELECT role,is_banned FROM users WHERE id=?", (target_id,)).fetchone()
                     if not target: return self.send_json(404, {"error": "Member not found"})
                     if target["role"] == "admin" or target_id == user["id"]: return self.send_json(400, {"error": "This account cannot be suspended"})
                     db.execute("UPDATE users SET is_banned=1-is_banned WHERE id=?", (target_id,))
+                    if not target["is_banned"]:
+                        db.execute("DELETE FROM sessions WHERE user_id=?", (target_id,))
                     db.execute("INSERT INTO moderation_log(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(user["id"],"toggle_ban","user",target_id,"Account suspension status changed",now()))
                     return self.send_json(200, {"ok": True})
                 if path == "/api/me/avatar":
@@ -1241,6 +1305,57 @@ class ForumHandler(SimpleHTTPRequestHandler):
             print("Request error:", repr(exc))
             return self.send_json(500, {"error": "Server error"})
 
+
+def migrate_sqlite_to_postgres(source_path):
+    """Copy an existing SQLite forum database into the configured empty PostgreSQL database."""
+    if not USE_POSTGRES:
+        raise RuntimeError("Set MASAHA_DB or DATABASE_URL to the destination PostgreSQL URL first")
+    source_path = Path(source_path).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"SQLite database not found: {source_path}")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = source_path.with_name(f"{source_path.stem}.pre-migration-{stamp}{source_path.suffix}")
+    with sqlite3.connect(source_path) as source, sqlite3.connect(backup_path) as backup:
+        source.backup(backup)
+    init_db()
+    order = ("categories", "users", "topics", "comments", "sessions", "direct_messages", "moderation_log", "reports",
+             "likes", "bookmarks", "user_follows", "category_follows", "poll_votes", "notifications", "reset_tokens",
+             "verification_tokens", "rate_events")
+    copied = {}
+    with sqlite3.connect(backup_path) as source, connect() as target:
+        if target.execute("SELECT COUNT(*) FROM users").fetchone()[0] or target.execute("SELECT COUNT(*) FROM topics").fetchone()[0]:
+            raise RuntimeError("Destination already contains accounts or topics; migrate into an empty database")
+        source.row_factory = sqlite3.Row
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in order:
+            if table not in tables:
+                continue
+            target_columns = target.columns(table)
+            source_columns = [row[1] for row in source.execute(f"PRAGMA table_info({table})")]
+            columns = [column for column in source_columns if column in target_columns]
+            if not columns:
+                continue
+            rows = source.execute(f"SELECT {','.join(columns)} FROM {table}").fetchall()
+            if not rows:
+                copied[table] = 0
+                continue
+            quoted = ",".join(columns)
+            marks = ",".join("?" for _ in columns)
+            conflict = " ON CONFLICT(slug) DO UPDATE SET name_ar=excluded.name_ar,name_en=excluded.name_en,description=excluded.description,created_at=excluded.created_at" if table == "categories" else " ON CONFLICT DO NOTHING"
+            for row in rows:
+                target.execute(f"INSERT INTO {table}({quoted}) VALUES({marks}){conflict}", tuple(row[column] for column in columns))
+            copied[table] = len(rows)
+        for table in ("users", "topics", "comments", "direct_messages", "moderation_log", "reports", "notifications", "rate_events"):
+            if table in tables:
+                target.execute("SELECT setval(pg_get_serial_sequence(?, 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM " + table + "), 1), 1), true)", (table,))
+    print(f"SQLite migration complete. Safety backup: {backup_path}")
+    for table, count in copied.items():
+        print(f"  {table}: {count}")
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--migrate-sqlite":
+    migrate_sqlite_to_postgres(sys.argv[2])
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     init_db()
