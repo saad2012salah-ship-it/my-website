@@ -142,7 +142,7 @@ def issue_verification_code(db, user):
     current = now()
     previous = db.execute("SELECT created_at FROM verification_tokens WHERE user_id=?", (user["id"],)).fetchone()
     if previous and previous["created_at"] > current - 60:
-        return False
+        return False, None
     code = f"{secrets.randbelow(1_000_000):06d}"
     db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
     db.execute("INSERT INTO verification_tokens(token_hash,user_id,expires_at,attempts,created_at) VALUES(?,?,?,?,?)",
@@ -153,7 +153,7 @@ def issue_verification_code(db, user):
         print("Verification email failed:", repr(exc)); sent = False
     if not sent:
         print(f"Email verification code for {user['email']} (valid for 10 minutes): {code}")
-    return True
+    return True, sent
 
 
 def backup_database():
@@ -794,11 +794,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 if path == "/api/verification-resend":
                     email = str(data.get("email", "")).strip().lower()
                     user = db.execute("SELECT * FROM users WHERE email=? AND email_verified=0", (email,)).fetchone()
-                    if user and not issue_verification_code(db, user):
+                    created, email_sent = issue_verification_code(db, user) if user else (True, False)
+                    if user and not created:
                         previous = db.execute("SELECT created_at FROM verification_tokens WHERE user_id=?", (user["id"],)).fetchone()
                         retry_after = max(1, 60 - (now() - previous["created_at"])) if previous else 60
                         return self.send_json(429, {"error": "RESEND_COOLDOWN", "retryAfter": retry_after})
-                    return self.send_json(200, {"sent": True})
+                    return self.send_json(200, {"sent": True, "emailSent": email_sent})
                 if path == "/api/register":
                     name = str(data.get("displayName", "")).strip()[:50]
                     username = str(data.get("username", "")).strip().lower()
@@ -821,8 +822,8 @@ class ForumHandler(SimpleHTTPRequestHandler):
                             return self.send_json(409, {"error": "USERNAME_TAKEN"})
                         return self.send_json(409, {"error": "That email is already registered"})
                     user = db.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
-                    issue_verification_code(db, user)
-                    return self.send_json(201, {"verificationRequired": True})
+                    _, email_sent = issue_verification_code(db, user)
+                    return self.send_json(201, {"verificationRequired": True, "emailSent": email_sent})
                 if path == "/api/login":
                     email = str(data.get("email", "")).strip().lower()
                     password = str(data.get("password", ""))
@@ -838,8 +839,8 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if not valid:
                         return self.send_json(401, {"error": "Email or password is incorrect"})
                     if not user["email_verified"]:
-                        issue_verification_code(db, user)
-                        return self.send_json(403, {"error": "EMAIL_NOT_VERIFIED"})
+                        _, email_sent = issue_verification_code(db, user)
+                        return self.send_json(403, {"error": "EMAIL_NOT_VERIFIED", "emailSent": email_sent})
                     if ADMIN_EMAIL and email == ADMIN_EMAIL and user["role"] != "admin":
                         db.execute("UPDATE users SET role='admin' WHERE id=?", (user["id"],))
                         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -1025,10 +1026,12 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     if email != user["email"]:
                         db.execute("DELETE FROM verification_tokens WHERE user_id=?", (user["id"],))
                         updated = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-                        issue_verification_code(db, updated)
+                        _, email_sent = issue_verification_code(db, updated)
+                    else:
+                        email_sent = True
                     updated = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
                     response_user = public_user(updated); response_user["email"] = updated["email"]
-                    response = {"ok": True, "verificationRequired": email != user["email"], "user": response_user}
+                    response = {"ok": True, "verificationRequired": email != user["email"], "emailSent": email_sent, "user": response_user}
                     headers = self.cookie_headers("", 0) if email != user["email"] else None
                     return self.send_json(200, response, headers)
                 if path == "/api/topics":
