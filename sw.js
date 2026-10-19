@@ -1,5 +1,5 @@
-const CACHE = "masaha-shell-v15";
-const SHELL = ["/", "/index.html", "/style.css?v=20261019-6", "/boot.js?v=20261019-6", "/app.js?v=20261019-6", "/manifest.json", "/icon.svg"];
+const CACHE = "masaha-shell-v16";
+const SHELL = ["/", "/index.html", "/style.css?v=20261019-7", "/boot.js?v=20261019-7", "/app.js?v=20261019-7", "/manifest.json", "/icon.svg"];
 self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener("activate", event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim())));
 self.addEventListener("fetch", event => {
