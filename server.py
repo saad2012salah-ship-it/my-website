@@ -372,6 +372,14 @@ def init_db():
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase ON users (LOWER(username))")
         else:
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase ON users(username COLLATE NOCASE)")
+        # Older databases may predate the email UNIQUE constraint. Add a
+        # case-insensitive index when existing records allow it; registration
+        # also checks explicitly below for databases that already contain dupes.
+        duplicate_email = db.execute(
+            "SELECT 1 FROM users GROUP BY lower(email) HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if not duplicate_email:
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_nocase ON users (LOWER(email))")
         # Add fields when opening a database created by an older version.
         for table, name, declaration in (
             ("users", "avatar_url", "TEXT NOT NULL DEFAULT ''"),
@@ -1015,6 +1023,8 @@ class ForumHandler(SimpleHTTPRequestHandler):
                         return self.send_json(400, {"error": "USERNAME_INVALID"})
                     if db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,)).fetchone():
                         return self.send_json(409, {"error": "USERNAME_TAKEN"})
+                    if db.execute("SELECT 1 FROM users WHERE lower(email)=?", (email,)).fetchone():
+                        return self.send_json(409, {"error": "EMAIL_TAKEN"})
                     salt = secrets.token_bytes(16)
                     digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
                     encoded = "scrypt$" + salt.hex() + "$" + digest.hex()
@@ -1025,7 +1035,9 @@ class ForumHandler(SimpleHTTPRequestHandler):
                     except DB_INTEGRITY_ERROR:
                         if db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,)).fetchone():
                             return self.send_json(409, {"error": "USERNAME_TAKEN"})
-                        return self.send_json(409, {"error": "That email is already registered"})
+                        if db.execute("SELECT 1 FROM users WHERE lower(email)=?", (email,)).fetchone():
+                            return self.send_json(409, {"error": "EMAIL_TAKEN"})
+                        return self.send_json(409, {"error": "EMAIL_TAKEN"})
                     user = db.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
                     token = secrets.token_urlsafe(32)
                     db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)",
