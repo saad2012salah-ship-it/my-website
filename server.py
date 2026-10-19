@@ -539,7 +539,8 @@ class ForumHandler(SimpleHTTPRequestHandler):
         c["masaha_session"]["httponly"] = True
         c["masaha_session"]["samesite"] = "Lax"
         c["masaha_session"]["max-age"] = str(max_age)
-        if COOKIE_SECURE:
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+        if COOKIE_SECURE or forwarded_proto == "https":
             c["masaha_session"]["secure"] = True
         return [("Set-Cookie", c.output(header="").strip())]
 
