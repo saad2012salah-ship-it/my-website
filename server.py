@@ -487,7 +487,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
     def do_HEAD(self):
         path = urlparse(self.path).path
         allowed = {"/": ROOT / "index.html", "/index.html": ROOT / "index.html",
-                   "/app.js": ROOT / "app.js", "/style.css": ROOT / "style.css",
+                   "/app.js": ROOT / "app.js", "/boot.js": ROOT / "boot.js", "/style.css": ROOT / "style.css",
                    "/manifest.json": ROOT / "manifest.json", "/sw.js": ROOT / "sw.js", "/icon.svg": ROOT / "icon.svg"}
         target = allowed.get(path)
         if not target or not target.is_file():
@@ -591,7 +591,7 @@ class ForumHandler(SimpleHTTPRequestHandler):
                 locs = [f"<url><loc>{SITE_URL}/</loc></url>"] + [f"<url><loc>{SITE_URL}/?topic={topic_id}</loc></url>" for topic_id in ids]
                 body = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" + "".join(locs) + "</urlset>").encode()
                 self.send_response(200); self.send_header("Content-Type", "application/xml; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-            if path not in ("/", "/index.html", "/app.js", "/style.css", "/manifest.json", "/sw.js", "/icon.svg"):
+            if path not in ("/", "/index.html", "/app.js", "/boot.js", "/style.css", "/manifest.json", "/sw.js", "/icon.svg"):
                 return self.send_error(404)
             return super().do_GET()
         with connect() as db:
